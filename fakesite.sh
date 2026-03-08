@@ -96,7 +96,6 @@ validate_domain() {
 
 validate_port() {
     local port="$1"
-    # Пустая строка — уже заменена дефолтом до вызова, но на всякий случай
     if [[ -z "$port" ]]; then
         die "Порт не может быть пустым"
     fi
@@ -110,6 +109,7 @@ validate_port() {
         warn "Порт $port < 1024 — привилегированный."
     fi
 }
+
 
 
 get_external_ip() {
@@ -424,19 +424,14 @@ echo ""
 read -rp "  Введите доменное имя:                           " DOMAIN
 [[ -z "$DOMAIN" ]] && die "Доменное имя не может быть пустым"
 validate_domain "$DOMAIN"
+validate_port "$SPORT"
 
 read -rp "  Email для Let's Encrypt (Enter = admin@$DOMAIN): " LE_EMAIL
-LE_EMAIL="${LE_EMAIL:-admin@$DOMAIN}"
+LE_EMAIL="${LE_EMAIL:-"admin@$DOMAIN"}"
 
 read -rp "  Внутренний SNI порт        (Enter = 9000):       " SPORT
 SPORT="${SPORT:-9000}"
-validate_port "$SPORT"
 
-echo ""
-echo -e "  ${CYAN}Тематика определяет что AI сгенерирует для сайта.${NC}"
-echo -e "  ${YELLOW}Примеры:${NC} ремонт квартир, юридические услуги, кофейня,"
-echo -e "           IT-компания, фитнес-клуб, медицинская клиника"
-echo ""
 read -rp "  Тематика сайта             (Enter = IT-компания): " SITE_THEME
 SITE_THEME="${SITE_THEME:-IT-компания}"
 
