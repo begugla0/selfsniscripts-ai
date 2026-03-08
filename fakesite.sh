@@ -259,11 +259,70 @@ print(json.dumps({
         return 1
     fi
 
+    # Сохраняем ответ во временный файл — избегаем проблем с передачей через pipe/herestring
+    local tmp_response
+    tmp_response=$(mktemp /tmp/ai_response_XXXXXX.json)
+    echo "$response" > "$tmp_response"
+
     local html
-    html=$(_parse_ai_response <<< "$response") || {
+    html=$(python3 << 'PYEOF' < "$tmp_response"
+import json, sys, re
+
+raw = sys.stdin.read()
+content = ''
+
+try:
+    data = json.loads(raw)
+    msg = data['choices'][0]['message']
+
+    content = (msg.get('content') or '').strip()
+
+    if not content:
+        rc = (msg.get('reasoning_content') or '').strip()
+        if rc:
+            sys.stderr.write("INFO: content пуст, ищем HTML в reasoning_content\n")
+            # Ищем <!DOCTYPE или <html в тексте рассуждений
+            m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', rc, re.IGNORECASE)
+            if m:
+                content = m.group(1).strip()
+                sys.stderr.write(f"INFO: HTML найден в reasoning_content ({len(content)} chars)\n")
+            else:
+                sys.stderr.write(f"ERROR: HTML не найден\nRC: {rc[:400]}\n")
+                sys.exit(1)
+
+    if not content:
+        sys.stderr.write("ERROR: content и reasoning_content пусты\n")
+        sys.exit(1)
+
+except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+    sys.stderr.write(f"JSON PARSE ERROR: {e}\nRAW: {raw[:300]}\n")
+    sys.exit(1)
+
+# Убираем markdown-обёртку
+content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
+content = re.sub(r'\n?```\s*$', '', content)
+content = content.strip()
+
+# Ищем HTML если он в середине текста
+if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
+    m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', content, re.IGNORECASE)
+    if m:
+        content = m.group(1).strip()
+
+if content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE):
+    print(content)
+    sys.exit(0)
+
+sys.stderr.write(f"NOT HTML. Start: {content[:200]}\n")
+sys.exit(1)
+PYEOF
+    ) || {
+        rm -f "$tmp_response"
         log "[$model] PARSE FAILED"
         return 1
     }
+
+    rm -f "$tmp_response"
 
     if [[ -z "$html" ]]; then
         log "[$model] HTML пустой после парсинга"
@@ -274,6 +333,7 @@ print(json.dumps({
     log "[$model] HTML записан: $(wc -c < "$output_file") байт"
     return 0
 }
+
 
 # ─── AI: главная функция с перебором моделей ─────────────────────────────────
 
