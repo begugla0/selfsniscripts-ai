@@ -314,22 +314,37 @@ generate_ai_site() {
     local theme="$1"
     local output_file="$2"
 
-    local -a models=("openai-fast" "openai")
+    # text.pollinations.ai может быть временно недоступен — пробуем несколько раз
+    local -a models=("openai-fast" "openai" "openai-large")
+    local max_attempts=3
+    local attempt=0
 
-    for model in "${models[@]}"; do
-        echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...                    "
-        if _try_generate "$theme" "$output_file" "$model"; then
-            log "Успех с моделью: $model"
-            echo -e "\r  ${GREEN}[AI]${NC} Модель ${CYAN}${model}${NC} сработала ✓                    "
-            return 0
+    while (( attempt < max_attempts )); do
+        (( attempt++ ))
+        log "Попытка $attempt/$max_attempts..."
+
+        for model in "${models[@]}"; do
+            echo -e "\r  ${BLUE}[AI]${NC} Попытка $attempt · модель: ${CYAN}${model}${NC}...                    "
+            if _try_generate "$theme" "$output_file" "$model"; then
+                log "Успех: попытка=$attempt модель=$model"
+                echo -e "\r  ${GREEN}[AI]${NC} Готово ✓  (попытка $attempt, модель ${CYAN}${model}${NC})                    "
+                return 0
+            fi
+            log "Модель $model не дала результат"
+            sleep 2
+        done
+
+        if (( attempt < max_attempts )); then
+            log "Все модели в попытке $attempt не сработали, пауза 15с..."
+            echo -e "\r  ${YELLOW}[AI]${NC} Сервис недоступен, повтор через 15 сек... (попытка $attempt/$max_attempts)                    "
+            sleep 15
         fi
-        log "Модель $model не дала результат"
-        sleep 1
     done
 
-    log "Все модели исчерпаны"
+    log "Все $max_attempts попыток исчерпаны"
     return 1
 }
+
 
 # ─── AI: спиннер ──────────────────────────────────────────────────────────────
 
