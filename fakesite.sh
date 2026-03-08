@@ -302,24 +302,57 @@ CRONEOF
 fi
 execute_silent "certbot renew --dry-run" || true
 
-# Шаг 12: Конфигурация Nginx (с фиксами)
+# Шаг 12: Конфигурация Nginx
 CURRENT_STEP=$((CURRENT_STEP + 1))
 show_progress $CURRENT_STEP $TOTAL_STEPS "Создание конфигурации Nginx..."
 log "Создание /etc/nginx/sites-enabled/sni.conf"
 
-# Фикс: server_names_hash_bucket_size
-if ! grep -q "server_names_hash_bucket_size" /etc/nginx/nginx.conf; then
-    sed -i '/http {/a\\tserver_names_hash_bucket_size 128;' /etc/nginx/nginx.conf
-    log "Добавлен server_names_hash_bucket_size 128"
-else
-    sed -i 's/.*server_names_hash_bucket_size.*/\tserver_names_hash_bucket_size 128;/' /etc/nginx/nginx.conf
-    log "Обновлен server_names_hash_bucket_size 128"
+# Найти nginx.conf (защита от нестандартных путей)
+NGINX_CONF=""
+for candidate in /etc/nginx/nginx.conf /usr/local/nginx/conf/nginx.conf /usr/local/etc/nginx/nginx.conf; do
+    if [[ -f "$candidate" ]]; then
+        NGINX_CONF="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$NGINX_CONF" ]]; then
+    show_warn "nginx.conf не найден, восстанавливаем через apt reinstall..."
+    log "nginx.conf отсутствует, запуск apt reinstall nginx"
+    execute_silent "DEBIAN_FRONTEND=noninteractive apt reinstall -y nginx"
+    NGINX_CONF="/etc/nginx/nginx.conf"
 fi
 
-# Фикс: удаляем все старые конфиги кроме sni.conf
+log "Используется nginx.conf: $NGINX_CONF"
+
+# Фикс: server_names_hash_bucket_size
+if grep -q "server_names_hash_bucket_size" "$NGINX_CONF"; then
+    sed -i 's/.*server_names_hash_bucket_size.*/\tserver_names_hash_bucket_size 128;/' "$NGINX_CONF"
+    log "Обновлен server_names_hash_bucket_size 128"
+else
+    sed -i '/http {/a\\tserver_names_hash_bucket_size 128;' "$NGINX_CONF"
+    log "Добавлен server_names_hash_bucket_size 128"
+fi
+
+# Создать sites-enabled если нет
+mkdir -p /etc/nginx/sites-enabled
+
+# Удалить только конфиги с нашим доменом (не трогать default и системные)
 for f in /etc/nginx/sites-enabled/*; do
-    [[ "$(basename $f)" != "sni.conf" ]] && { rm -f "$f"; log "Удален конфиг: $f"; }
+    [[ ! -f "$f" ]] && continue
+    fname=$(basename "$f")
+    [[ "$fname" == "sni.conf" ]] && continue
+    if grep -q "$DOMAIN" "$f" 2>/dev/null; then
+        rm -f "$f"
+        log "Удален конфликтующий конфиг: $f"
+    fi
 done
+
+# Убрать default если он есть (конфликт server_name _)
+[[ -f /etc/nginx/sites-enabled/default ]] && {
+    rm -f /etc/nginx/sites-enabled/default
+    log "Удален default конфиг"
+}
 
 cat > /etc/nginx/sites-enabled/sni.conf <<EOF
 server {
@@ -352,7 +385,7 @@ server {
 }
 EOF
 
-log "nginx.conf проверка:"
+log "nginx.conf тест:"
 nginx -t >> "$LOG_FILE" 2>&1
 NGINX_TEST=$?
 log "nginx -t exit code: $NGINX_TEST"
@@ -363,6 +396,7 @@ if [[ $NGINX_TEST -ne 0 ]]; then
     exit 1
 fi
 show_complete "Конфигурация Nginx создана и проверена"
+
 
 # Шаг 13: Запуск Nginx
 CURRENT_STEP=$((CURRENT_STEP + 1))
