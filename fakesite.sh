@@ -282,7 +282,7 @@ generate_ai_site() {
     local output_file="$2"
 
     # Модели от не-думающих к думающим
-    local -a models=("mistral" "openai" "claude-email" "llama")
+    local -a models=("openai" "claude-fast" "nova-fast" "openai-fast")
 
     for model in "${models[@]}"; do
         echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...${YELLOW}                    ${NC}"
