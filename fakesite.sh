@@ -11,7 +11,7 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # ─── Константы ────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="2.8.0"
+SCRIPT_VERSION="2.9.0"
 SCRIPT_NAME="Self SNI Scripts"
 GITHUB_URL="https://github.com/begugla0/selfsniscripts"
 LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
@@ -253,7 +253,7 @@ try:
             if m:
                 content = m.group(1).strip()
             else:
-                sys.stderr.write(f"ERROR: HTML не найден в reasoning\nRC end: {rc[-300:]}\n")
+                sys.stderr.write(f"ERROR: HTML не найден в reasoning\n")
                 sys.exit(1)
 
     if not content:
@@ -285,12 +285,12 @@ if size < 3000:
     sys.stderr.write(f"TOO SMALL: {size} bytes\n")
     sys.exit(1)
 
-sys.stderr.write(f"OK: {size} bytes\n")
-print(content)
+with open(sys.argv[2], 'w', encoding='utf-8') as f:
+    f.write(content)
+sys.stderr.write(f"OK: {size} bytes written\n")
 PYEOF
 
-    local html
-    html=$(python3 "$parse_script" "$response_file" 2>> "$LOG_FILE") || {
+    python3 "$parse_script" "$response_file" "$output_file" 2>> "$LOG_FILE" || {
         rm -f "$response_file" "$parse_script"
         log "[$model] PARSE FAILED"
         return 1
@@ -298,23 +298,21 @@ PYEOF
 
     rm -f "$response_file" "$parse_script"
 
-    if [[ -z "$html" ]]; then
-        log "[$model] HTML пустой после парсинга"
+    if [[ ! -s "$output_file" ]]; then
+        log "[$model] output_file пустой"
         return 1
     fi
 
-    echo "$html" > "$output_file"
     log "[$model] HTML записан: $(wc -c < "$output_file") байт"
     return 0
 }
 
-# ─── AI: перебор моделей ──────────────────────────────────────────────────────
+# ─── AI: перебор моделей с retry ──────────────────────────────────────────────
 
 generate_ai_site() {
     local theme="$1"
     local output_file="$2"
 
-    # text.pollinations.ai может быть временно недоступен — пробуем несколько раз
     local -a models=("openai-fast" "openai" "openai-large")
     local max_attempts=3
     local attempt=0
@@ -344,7 +342,6 @@ generate_ai_site() {
     log "Все $max_attempts попыток исчерпаны"
     return 1
 }
-
 
 # ─── AI: спиннер ──────────────────────────────────────────────────────────────
 
@@ -537,7 +534,7 @@ log "=== $SCRIPT_NAME v$SCRIPT_VERSION started ==="
 
 clear
 echo -e "${CYAN}╔═════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   $SCRIPT_NAME v$SCRIPT_VERSION by begugla         ║${NC}"
+echo -e "${CYAN}║   $SCRIPT_NAME v$SCRIPT_VERSION by begugla        ║${NC}"
 echo -e "${CYAN}╚═════════════════════════════════════════════════════╝${NC}"
 echo ""
 
