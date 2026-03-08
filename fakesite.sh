@@ -11,7 +11,7 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # ─── Константы ────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="2.9.0"
+SCRIPT_VERSION="3.0.0"
 SCRIPT_NAME="Self SNI Scripts"
 GITHUB_URL="https://github.com/begugla0/selfsniscripts"
 LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
@@ -143,13 +143,16 @@ check_port_free() {
 build_ai_prompt() {
     local theme="$1"
     cat <<EOF
+IMPORTANT: Do NOT think out loud. Do NOT reason. Output ONLY the final HTML immediately.
+
 You are an expert front-end developer. Generate a complete, production-ready single-file website for the following theme: "${theme}".
 
 STRICT OUTPUT RULES — FOLLOW EXACTLY:
 - Output ONLY the raw HTML document. Start with <!DOCTYPE html> on the very first character.
-- Do NOT wrap in markdown fences (\`\`\`html or \`\`\`).
+- Do NOT wrap in markdown fences.
 - Do NOT add any explanation, commentary, preamble, or text outside the HTML.
-- Do NOT include HTML comments (<!-- ... -->).
+- Do NOT include HTML comments.
+- Do NOT think before answering. Just output HTML directly.
 
 DESIGN REQUIREMENTS:
 - Single .html file: all CSS in <style>, all JS in <script> — no external CDN links.
@@ -195,8 +198,7 @@ print(json.dumps({
     'messages': [{'role': 'user', 'content': prompt}],
     'stream': False,
     'seed': $rand_seed,
-    'max_tokens': 32000,
-    'reasoning': {'effort': 'low'}
+    'max_tokens': 16000
 }))
 " <<< "$prompt" > "$payload_file"
     local py_exit=$?
@@ -228,7 +230,6 @@ print(json.dumps({
 
     log "[$model] RAW (first 300): $(head -c 300 "$response_file")"
 
-    # Проверка на 502/nginx ошибку до парсинга JSON
     local first_bytes
     first_bytes=$(head -c 15 "$response_file" 2>/dev/null || true)
     if [[ "$first_bytes" != *"{"* ]]; then
@@ -291,7 +292,7 @@ if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', cont
     sys.exit(1)
 
 size = len(content)
-if size < 500:
+if size < 3000:
     sys.stderr.write(f"TOO SMALL: {size} bytes\n")
     sys.exit(1)
 
@@ -323,7 +324,7 @@ generate_ai_site() {
     local theme="$1"
     local output_file="$2"
 
-    local -a models=("openai-fast" "openai" "openai-large")
+    local -a models=("openai-fast" "openai" "mistral")
     local max_attempts=3
     local attempt=0
 
@@ -489,7 +490,6 @@ write_nginx_config() {
     log "Nginx $nginx_ver: используем '$http2_listen'"
 
     cat > "$conf_path" <<EOF
-# Сгенерировано $SCRIPT_NAME v$SCRIPT_VERSION — $(date)
 server {
     listen 80;
     server_name $domain;
@@ -544,18 +544,15 @@ log "=== $SCRIPT_NAME v$SCRIPT_VERSION started ==="
 
 clear
 echo -e "${CYAN}╔═════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   $SCRIPT_NAME v$SCRIPT_VERSION by begugla        ║${NC}"
+echo -e "${CYAN}║   $SCRIPT_NAME v$SCRIPT_VERSION by begugla       ║${NC}"
 echo -e "${CYAN}╚═════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# ── 0. Root ──────────────────────────────────────────────────────────────────
 require_root
 
-# ── 1. Проверка ОС ───────────────────────────────────────────────────────────
 step "Проверка операционной системы..."
 detect_os
 
-# ── 2. Ввод параметров ───────────────────────────────────────────────────────
 step "Ожидание ввода данных..."
 echo ""
 
@@ -582,48 +579,40 @@ validate_port "$SPORT"
 ok "Параметры: домен=$DOMAIN  порт=$SPORT  тема=\"$SITE_THEME\""
 log "Параметры: DOMAIN=$DOMAIN LE_EMAIL=$LE_EMAIL SPORT=$SPORT SITE_THEME=$SITE_THEME"
 
-# ── 3. Обновление пакетов ────────────────────────────────────────────────────
 step "Обновление списка пакетов..."
 wait_apt_lock
 run "apt-get update -qq" || die "Не удалось обновить список пакетов"
 ok "Список пакетов обновлён"
 
-# ── 4. Установка зависимостей ────────────────────────────────────────────────
 step "Установка зависимостей..."
 PACKAGES=(nginx certbot python3-certbot-nginx curl dnsutils python3)
 run "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${PACKAGES[*]}" \
     || die "Не удалось установить: ${PACKAGES[*]}"
 ok "Установлено: ${PACKAGES[*]}"
 
-# ── 5. Внешний IP ────────────────────────────────────────────────────────────
 step "Определение внешнего IP..."
 EXTERNAL_IP=$(get_external_ip) || die "Не удалось определить внешний IP"
 ok "Внешний IP: $EXTERNAL_IP"
 
-# ── 6. DNS A-запись ──────────────────────────────────────────────────────────
 step "Проверка A-записи $DOMAIN..."
 DOMAIN_IP=$(dig +short A "$DOMAIN" @1.1.1.1 | grep -E '^[0-9.]+$' | head -n1 || true)
 [[ -z "$DOMAIN_IP" ]] && die "A-запись для $DOMAIN не найдена" "$GITHUB_URL"
 ok "DNS A-запись: $DOMAIN_IP"
 
-# ── 7. Сверка IP ─────────────────────────────────────────────────────────────
 step "Проверка соответствия DNS ↔ IP сервера..."
 [[ "$DOMAIN_IP" != "$EXTERNAL_IP" ]] \
     && die "DNS ($DOMAIN_IP) ≠ IP сервера ($EXTERNAL_IP). Обновите A-запись." "$GITHUB_URL"
 ok "DNS корректен: $DOMAIN_IP = $EXTERNAL_IP"
 
-# ── 8. Остановка nginx ───────────────────────────────────────────────────────
 step "Остановка nginx..."
 systemctl stop nginx 2>/dev/null || true
 ok "Nginx остановлен"
 
-# ── 9. Проверка портов ───────────────────────────────────────────────────────
 step "Проверка доступности портов 80/443..."
 check_port_free 80
 check_port_free 443
 ok "Порты 80 и 443 свободны"
 
-# ── 10. AI генерация сайта ───────────────────────────────────────────────────
 step "Генерация сайта через AI (тема: \"$SITE_THEME\")..."
 echo -e "\n  ${CYAN}Запрос отправлен. AI думает — это может занять до 5 минут.${NC}"
 
@@ -694,21 +683,18 @@ FALLBACK
 fi
 rm -f "$AI_HTML_FILE"
 
-# ── 11. SSL сертификат ───────────────────────────────────────────────────────
 step "Получение SSL сертификата..."
 run "certbot certonly --standalone -d $DOMAIN --agree-tos -m $LE_EMAIL --non-interactive" \
     || die "Не удалось получить SSL. Проверьте DNS и порты." "$GITHUB_URL"
 ok "SSL сертификат получен"
 setup_certbot_renewal
 
-# ── 12. Конфиг Nginx ─────────────────────────────────────────────────────────
 step "Создание конфигурации Nginx..."
 CONF_PATH="$NGINX_CONF_DIR/sni_${DOMAIN}.conf"
 write_nginx_config "$DOMAIN" "$SPORT" "$CONF_PATH"
 rm -f "$NGINX_CONF_DIR/default"
 ok "Конфиг записан: $CONF_PATH"
 
-# ── 13. Nginx тест + запуск ──────────────────────────────────────────────────
 step "Запуск Nginx..."
 nginx -t >> "$LOG_FILE" 2>&1 \
     || die "Конфигурация Nginx содержит ошибки. Лог: $LOG_FILE"
@@ -716,7 +702,6 @@ systemctl enable --now nginx >> "$LOG_FILE" 2>&1 \
     || die "Не удалось запустить Nginx. Лог: $LOG_FILE"
 ok "Nginx запущен и добавлен в автозагрузку"
 
-# ── 14. Финальная проверка ───────────────────────────────────────────────────
 step "Финальная проверка сервера..."
 sleep 1
 set +e
@@ -729,7 +714,6 @@ else
     warn "Сервер не ответил на тестовый запрос (возможно, нужен proxy_protocol)"
 fi
 
-# ─── Итог ─────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}╔═════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║              Установка завершена!                   ║${NC}"
