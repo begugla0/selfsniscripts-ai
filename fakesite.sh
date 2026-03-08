@@ -233,8 +233,12 @@ _try_generate() {
     local prompt
     prompt=$(build_ai_prompt "$theme")
 
-    local payload
-    payload=$(python3 -c "
+    local payload_file response_file
+    payload_file=$(mktemp /tmp/ai_payload_XXXXXX.json)
+    response_file=$(mktemp /tmp/ai_response_XXXXXX.json)
+
+    # Строим payload через файл
+    python3 -c "
 import json, sys
 prompt = sys.stdin.read()
 print(json.dumps({
@@ -242,30 +246,35 @@ print(json.dumps({
     'messages': [{'role': 'user', 'content': prompt}],
     'stream': False
 }))
-" <<< "$prompt") || { log "[$model] PAYLOAD BUILD FAILED"; return 1; }
+" <<< "$prompt" > "$payload_file" || {
+        log "[$model] PAYLOAD BUILD FAILED"
+        rm -f "$payload_file" "$response_file"
+        return 1
+    }
 
     log "[$model] Отправляем запрос..."
 
-    local response
-    response=$(curl -s --max-time 120 \
+    # Сохраняем ответ в файл напрямую — избегаем обрезки больших строк в bash
+    curl -s --max-time 120 \
         -X POST "$AI_API_URL" \
         -H "content-type: application/json" \
-        -d "$payload") || { log "[$model] CURL FAILED"; return 1; }
+        -d "@$payload_file" \
+        -o "$response_file" || {
+        log "[$model] CURL FAILED"
+        rm -f "$payload_file" "$response_file"
+        return 1
+    }
 
-    log "[$model] RAW (first 400): ${response:0:400}"
+    log "[$model] RAW (first 400): $(head -c 400 "$response_file")"
 
-    if [[ -z "$response" ]]; then
+    if [[ ! -s "$response_file" ]]; then
         log "[$model] Пустой ответ"
+        rm -f "$payload_file" "$response_file"
         return 1
     fi
 
-    # Сохраняем ответ во временный файл — избегаем проблем с передачей через pipe/herestring
-    local tmp_response
-    tmp_response=$(mktemp /tmp/ai_response_XXXXXX.json)
-    echo "$response" > "$tmp_response"
-
     local html
-    html=$(python3 << 'PYEOF' < "$tmp_response"
+    html=$(python3 << 'PYEOF' < "$response_file"
 import json, sys, re
 
 raw = sys.stdin.read()
@@ -273,21 +282,28 @@ content = ''
 
 try:
     data = json.loads(raw)
+
+    # Проверяем на ошибку API
+    if 'error' in data:
+        sys.stderr.write(f"API ERROR: {data.get('error','')}\n")
+        sys.exit(1)
+
     msg = data['choices'][0]['message']
 
+    # Сначала content
     content = (msg.get('content') or '').strip()
 
+    # Думающие модели — HTML в reasoning_content
     if not content:
         rc = (msg.get('reasoning_content') or '').strip()
         if rc:
-            sys.stderr.write("INFO: content пуст, ищем HTML в reasoning_content\n")
-            # Ищем <!DOCTYPE или <html в тексте рассуждений
+            sys.stderr.write(f"INFO: content пуст, ищем HTML в reasoning_content ({len(rc)} chars)\n")
             m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', rc, re.IGNORECASE)
             if m:
                 content = m.group(1).strip()
-                sys.stderr.write(f"INFO: HTML найден в reasoning_content ({len(content)} chars)\n")
+                sys.stderr.write(f"INFO: HTML найден ({len(content)} chars)\n")
             else:
-                sys.stderr.write(f"ERROR: HTML не найден\nRC: {rc[:400]}\n")
+                sys.stderr.write(f"ERROR: HTML не найден в reasoning_content\nRC[:400]: {rc[:400]}\n")
                 sys.exit(1)
 
     if not content:
@@ -295,7 +311,7 @@ try:
         sys.exit(1)
 
 except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
-    sys.stderr.write(f"JSON PARSE ERROR: {e}\nRAW: {raw[:300]}\n")
+    sys.stderr.write(f"JSON PARSE ERROR: {e}\nRAW[:300]: {raw[:300]}\n")
     sys.exit(1)
 
 # Убираем markdown-обёртку
@@ -308,24 +324,25 @@ if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', cont
     m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', content, re.IGNORECASE)
     if m:
         content = m.group(1).strip()
+        sys.stderr.write("INFO: HTML извлечён из середины\n")
 
 if content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE):
     print(content)
     sys.exit(0)
 
-sys.stderr.write(f"NOT HTML. Start: {content[:200]}\n")
+sys.stderr.write(f"NOT HTML. Start: {content[:300]}\n")
 sys.exit(1)
 PYEOF
     ) || {
-        rm -f "$tmp_response"
+        rm -f "$payload_file" "$response_file"
         log "[$model] PARSE FAILED"
         return 1
     }
 
-    rm -f "$tmp_response"
+    rm -f "$payload_file" "$response_file"
 
     if [[ -z "$html" ]]; then
-        log "[$model] HTML пустой после парсинга"
+        log "[$model] HTML пустой"
         return 1
     fi
 
@@ -335,6 +352,7 @@ PYEOF
 }
 
 
+
 # ─── AI: главная функция с перебором моделей ─────────────────────────────────
 
 generate_ai_site() {
@@ -342,7 +360,7 @@ generate_ai_site() {
     local output_file="$2"
 
     # Модели от не-думающих к думающим
-    local -a models=("openai" "claude-fast" "nova-fast" "openai-fast")
+    local -a models=("openai-fast" "openai" "mistral")
 
     for model in "${models[@]}"; do
         echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...${YELLOW}                    ${NC}"
@@ -516,7 +534,6 @@ ${http2_directive}
 
     ssl_certificate         /etc/letsencrypt/live/$domain/fullchain.pem;
     ssl_certificate_key     /etc/letsencrypt/live/$domain/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/$domain/chain.pem;
 
     ssl_protocols           TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers on;
@@ -524,11 +541,6 @@ ${http2_directive}
     ssl_session_cache       shared:SSL:10m;
     ssl_session_timeout     1d;
     ssl_session_tickets     off;
-
-    ssl_stapling            on;
-    ssl_stapling_verify     on;
-    resolver                1.1.1.1 8.8.8.8 valid=300s;
-    resolver_timeout        5s;
 
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Frame-Options DENY always;
@@ -545,6 +557,7 @@ ${http2_directive}
 }
 EOF
 }
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ТОЧКА ВХОДА
