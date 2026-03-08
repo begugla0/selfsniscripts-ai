@@ -1,145 +1,168 @@
 #!/bin/bash
-set -euo pipefail
 
-# ─── Цвета ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
 NC='\033[0m'
-
-# ─── Константы ────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="3.1.0"
-SCRIPT_NAME="Self SNI Scripts"
-GITHUB_URL="https://github.com/begugla0/selfsniscripts"
-LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
-NGINX_CONF_DIR="/etc/nginx/sites-enabled"
-WEBROOT="/var/www/html"
-AI_API_URL="https://gen.pollinations.ai/v1/chat/completions"
-AI_API_TOKEN="pk_XDXnwCpYbihkQcEg"
-
-TOTAL_STEPS=14
-CURRENT_STEP=0
-
-# ─── Утилиты ──────────────────────────────────────────────────────────────────
-
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
 
 show_progress() {
     local current=$1 total=$2 status=$3
     local percent=$((current * 100 / total))
-    local filled=$((percent / 2))
-    local empty=$((50 - filled))
-    printf "\r${CYAN}[%s%s]${NC} ${GREEN}%3d%%${NC} ${YELLOW}%s${NC}" \
-        "$(printf '%*s' "$filled" '' | tr ' ' '=')" \
-        "$(printf '%*s' "$empty" '')" \
-        "$percent" "$status"
+    local filled=$((percent / 2)) empty=$((50 - filled))
+    printf "\r${CYAN}["
+    printf "%${filled}s" | tr ' ' '='
+    printf "%${empty}s" | tr ' ' ' '
+    printf "] ${GREEN}%3d%%${NC} ${YELLOW}%s${NC}" "$percent" "$status"
 }
 
-step() {
-    CURRENT_STEP=$((CURRENT_STEP + 1))
-    show_progress "$CURRENT_STEP" "$TOTAL_STEPS" "$1"
-    log "STEP $CURRENT_STEP/$TOTAL_STEPS: $1"
+show_complete() { echo -e "\n${GREEN}[OK]${NC} ${1}"; }
+show_error()    { echo -e "\n${RED}[ERROR]${NC} ${1}"; }
+
+execute_silent() {
+    local log_file="/tmp/sni_setup_$(date +%s).log"
+    eval "$1" >> "$log_file" 2>&1
+    return $?
 }
 
-ok()   { echo -e "\n${GREEN}[OK]${NC} $1";    log "OK: $1"; }
-warn() { echo -e "\n${YELLOW}[WARN]${NC} $1"; log "WARN: $1"; }
-die()  {
-    echo -e "\n${RED}[ERROR]${NC} $1"
-    log "ERROR: $1"
-    [[ -n "${2:-}" ]] && echo -e "${YELLOW}Подробнее: $2${NC}"
-    echo -e "${YELLOW}Лог: $LOG_FILE${NC}"
+clear
+echo -e "${CYAN}=====================================================${NC}"
+echo -e "${CYAN}  Установка и настройка Self SNI Scripts by begugla  ${NC}"
+echo -e "${CYAN}=====================================================${NC}"
+echo ""
+
+TOTAL_STEPS=13
+CURRENT_STEP=0
+
+# Шаг 1: Проверка ОС
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Проверка операционной системы..."
+sleep 0.3
+if ! grep -E -q "^(ID=debian|ID=ubuntu)" /etc/os-release; then
+    show_error "Система не поддерживается. Требуется Debian или Ubuntu."
     exit 1
-}
+fi
+show_complete "Операционная система совместима"
 
-run() { log "RUN: $*"; eval "$*" >> "$LOG_FILE" 2>&1; }
+# Шаг 2: Запрос параметров
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Ожидание ввода данных..."
+echo ""
+read -p "Введите доменное имя: " DOMAIN
+if [[ -z "$DOMAIN" ]]; then
+    show_error "Доменное имя не может быть пустым"
+    exit 1
+fi
+read -p "Введите внутренний SNI Self порт (Enter для 9000): " SPORT
+SPORT=${SPORT:-9000}
 
-require_root() {
-    [[ "$EUID" -eq 0 ]] || die "Скрипт должен быть запущен от root (sudo)"
-}
+echo ""
+echo -e "${CYAN}Доступные тематики сайта:${NC}"
+echo -e "  ${YELLOW}1${NC}) IT / Технологии"
+echo -e "  ${YELLOW}2${NC}) Медицина / Здоровье"
+echo -e "  ${YELLOW}3${NC}) Финансы / Инвестиции"
+echo -e "  ${YELLOW}4${NC}) Образование / Курсы"
+echo -e "  ${YELLOW}5${NC}) Строительство / Недвижимость"
+echo -e "  ${YELLOW}6${NC}) Ресторан / Еда"
+echo -e "  ${YELLOW}7${NC}) Своя тема (ввод вручную)"
+read -p "Выберите тематику [1-7]: " THEME_CHOICE
 
-wait_apt_lock() {
-    local i=0
-    while fuser /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock > /dev/null 2>&1; do
-        (( i++ > 60 )) && die "APT заблокирован другим процессом."
-        printf "\r${YELLOW}Ожидание APT lock... %ds${NC}" "$i"
-        sleep 1
-    done
-}
+case "$THEME_CHOICE" in
+    1) THEME="IT-компания и технологические решения" ;;
+    2) THEME="Медицинский центр и здоровье" ;;
+    3) THEME="Финансовые услуги и инвестиции" ;;
+    4) THEME="Образовательная платформа и онлайн-курсы" ;;
+    5) THEME="Строительная компания и недвижимость" ;;
+    6) THEME="Ресторан и доставка еды" ;;
+    7)
+        read -p "Введите свою тему на русском: " THEME
+        if [[ -z "$THEME" ]]; then
+            THEME="Современная компания"
+        fi
+        ;;
+    *) THEME="IT-компания и технологические решения" ;;
+esac
 
-detect_os() {
-    [[ -f /etc/os-release ]] || die "Не найден /etc/os-release"
-    # shellcheck disable=SC1091
-    source /etc/os-release
-    OS_ID="${ID:-unknown}"
-    OS_VERSION="${VERSION_ID:-unknown}"
-    OS_LIKE="${ID_LIKE:-}"
-    case "$OS_ID" in
-        ubuntu|debian) ;;
-        *)
-            if [[ "$OS_LIKE" =~ (ubuntu|debian) ]]; then
-                warn "Производная система ($OS_ID). Продолжаем как Debian-совместимую."
-            else
-                die "ОС '$OS_ID' не поддерживается. Требуется Debian/Ubuntu."
-            fi
-            ;;
-    esac
-    ok "ОС: $OS_ID $OS_VERSION"
-}
+show_complete "Параметры получены (тема: $THEME)"
 
-validate_domain() {
-    local domain="$1"
-    local result
-    result=$(echo "$domain" | grep -cE '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$' || true)
-    if [[ "$result" -eq 0 ]]; then
-        die "Некорректный формат домена: $domain"
-    fi
-}
+# Шаг 3: Обновление пакетов
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Обновление списка пакетов..."
+if execute_silent "apt update"; then
+    show_complete "Список пакетов обновлен"
+else
+    show_error "Не удалось обновить список пакетов"
+    exit 1
+fi
 
-validate_port() {
-    local port="${1:-}"
-    [[ -z "$port" ]] && die "Порт не может быть пустым"
-    [[ "$port" =~ ^[0-9]+$ ]] || die "Порт должен быть числом: $port"
-    local port_num=$(( port + 0 ))
-    [[ $port_num -lt 1 || $port_num -gt 65535 ]] && die "Некорректный порт: $port (допустимо 1–65535)"
-    [[ $port_num -lt 1024 ]] && warn "Порт $port < 1024 — привилегированный."
-}
+# Шаг 4: Установка зависимостей
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Установка компонентов (nginx, certbot, git, jq)..."
+if execute_silent "DEBIAN_FRONTEND=noninteractive apt install -y nginx certbot python3-certbot-nginx git curl dnsutils jq"; then
+    show_complete "Компоненты успешно установлены"
+else
+    show_error "Не удалось установить необходимые компоненты"
+    exit 1
+fi
 
-get_external_ip() {
-    local ip=""
-    for url in \
-        "https://api.ipify.org" \
-        "https://ifconfig.me" \
-        "https://icanhazip.com" \
-        "https://checkip.amazonaws.com"
-    do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]') || true
-        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
-    done
-    return 1
-}
+# Шаг 5: Внешний IP
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Определение внешнего IP сервера..."
+external_ip=$(curl -s --max-time 5 https://api.ipify.org)
+if [[ -z "$external_ip" ]]; then
+    show_error "Не удалось определить внешний IP сервера"
+    exit 1
+fi
+show_complete "Внешний IP сервера: $external_ip"
 
-check_port_free() {
-    local port="$1"
-    local result
-    result=$(ss -tuln 2>/dev/null | grep -c ":${port} \|:${port}$" || true)
-    [[ "$result" -gt 0 ]] && die "Порт $port занят. Освободите его перед установкой." "$GITHUB_URL"
-}
+# Шаг 6: DNS A-запись
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Проверка A-записи домена..."
+domain_ip=$(dig +short A "$DOMAIN" | head -n1)
+if [[ -z "$domain_ip" ]]; then
+    show_error "Не удалось получить A-запись для домена $DOMAIN"
+    exit 1
+fi
+show_complete "A-запись домена: $domain_ip"
 
-# ─── AI: промт ────────────────────────────────────────────────────────────────
+# Шаг 7: Сравнение IP
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Проверка соответствия DNS записи..."
+if [[ "$domain_ip" != "$external_ip" ]]; then
+    show_error "A-запись домена не соответствует внешнему IP сервера"
+    exit 1
+fi
+show_complete "DNS записи корректны"
 
-build_ai_prompt() {
-    local theme="$1"
-    cat <<EOF
-You are an expert front-end developer. Generate a complete, production-ready single-file website for the following theme: "${theme}".
+# Шаг 8: Остановка nginx
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Остановка nginx..."
+systemctl stop nginx 2>/dev/null || true
+show_complete "Nginx остановлен"
+
+# Шаг 9: Проверка портов
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Проверка портов 80 и 443..."
+if ss -tuln | grep -q ":443 "; then
+    show_error "Порт 443 занят"; exit 1
+fi
+if ss -tuln | grep -q ":80 "; then
+    show_error "Порт 80 занят"; exit 1
+fi
+show_complete "Порты 80 и 443 свободны"
+
+# Шаг 10: Генерация сайта через ИИ
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Генерация сайта через ИИ (тема: $THEME)..."
+
+AI_PROMPT="You are an expert front-end developer. Generate a complete, production-ready single-file website for the following theme: \\\"${THEME}\\\".
 
 STRICT OUTPUT RULES — FOLLOW EXACTLY:
 - Output ONLY the raw HTML document. Start with <!DOCTYPE html> on the very first character.
-- Do NOT wrap in markdown fences.
+- Do NOT wrap in markdown fences (\`\`\`html or \`\`\`).
 - Do NOT add any explanation, commentary, preamble, or text outside the HTML.
-- Do NOT include HTML comments.
+- Do NOT include HTML comments (<!-- ... -->).
 
 DESIGN REQUIREMENTS:
 - Single .html file: all CSS in <style>, all JS in <script> — no external CDN links.
@@ -150,577 +173,141 @@ DESIGN REQUIREMENTS:
 - Believable content: realistic company name, tagline, 3-6 service cards with icons (inline SVG), testimonials or stats block.
 - CTA button with ripple animation on click.
 - Color palette based on theme, glassmorphism cards.
-- Language: Russian.
-EOF
-}
+- Language: Russian."
 
-# ─── AI: попытка генерации ────────────────────────────────────────────────────
+AI_REQUEST=$(jq -n \
+    --arg prompt "$AI_PROMPT" \
+    '{
+        model: "openai-fast",
+        messages: [{role: "user", content: $prompt}]
+    }')
 
-_try_generate() {
-    local theme="$1"
-    local output_file="$2"
-    local model="$3"
+AI_RESPONSE=$(curl -s --max-time 120 \
+    -H "accept: */*" \
+    -H "authorization: Bearer pk_XDXnwCpYbihkQcEg" \
+    -H "content-type: application/json" \
+    -H "origin: https://pollinations.ai" \
+    -H "referer: https://pollinations.ai/" \
+    "https://gen.pollinations.ai/v1/chat/completions" \
+    -d "$AI_REQUEST")
 
-    log "[$model] _try_generate START"
+GENERATED_HTML=$(echo "$AI_RESPONSE" | jq -r '.choices[0].message.content // empty')
 
-    local prompt
-    prompt=$(build_ai_prompt "$theme") || {
-        log "[$model] build_ai_prompt FAILED"
-        return 1
-    }
-    log "[$model] prompt length: ${#prompt}"
+if [[ -z "$GENERATED_HTML" ]] || ! echo "$GENERATED_HTML" | grep -qi "<!DOCTYPE"; then
+    show_error "ИИ не вернул корректный HTML, устанавливаем заглушку..."
+    cat > /var/www/html/index.html <<FALLBACK
+<!DOCTYPE html>
+<html lang="ru">
+<head><meta charset="UTF-8"><title>${DOMAIN}</title>
+<style>body{background:#0b1020;color:#e8e8f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}h1{font-size:2rem;}</style>
+</head>
+<body><h1>${DOMAIN}</h1></body>
+</html>
+FALLBACK
+else
+    echo "$GENERATED_HTML" > /var/www/html/index.html
+    show_complete "Сайт сгенерирован ИИ и сохранён"
+fi
 
-    local payload_file response_file parse_script
-    payload_file=$(mktemp /tmp/ai_payload_XXXXXX.json)
-    response_file=$(mktemp /tmp/ai_response_XXXXXX.json)
-    parse_script=$(mktemp /tmp/ai_parser_XXXXXX.py)
+# Шаг 11: SSL сертификат
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Получение SSL сертификата (может занять время)..."
+if execute_silent "certbot certonly --standalone -d $DOMAIN --agree-tos -m admin@$DOMAIN --non-interactive"; then
+    show_complete "SSL сертификат успешно получен"
+else
+    show_error "Не удалось получить SSL сертификат"
+    exit 1
+fi
 
-    local rand_seed=$(( RANDOM * RANDOM ))
-
-    python3 -c "
-import json, sys
-prompt = sys.stdin.read()
-print(json.dumps({
-    'model': '$model',
-    'messages': [{'role': 'user', 'content': prompt}],
-    'stream': False,
-    'seed': $rand_seed,
-    'max_tokens': 16000
-}))
-" <<< "$prompt" > "$payload_file"
-    local py_exit=$?
-    log "[$model] payload python exit=$py_exit size=$(wc -c < "$payload_file")"
-
-    if [[ $py_exit -ne 0 ]]; then
-        log "[$model] PAYLOAD FAILED"
-        rm -f "$payload_file" "$response_file" "$parse_script"
-        return 1
+# Автопродление
+if systemctl list-timers 2>/dev/null | grep -q certbot.timer; then
+    systemctl enable certbot.timer 2>/dev/null || true
+    systemctl start certbot.timer 2>/dev/null || true
+    if ! systemctl cat certbot.timer 2>/dev/null | grep -q "Persistent=true"; then
+        mkdir -p /etc/systemd/system/certbot.timer.d/
+        printf '[Timer]\nPersistent=true\n' > /etc/systemd/system/certbot.timer.d/override.conf
+        systemctl daemon-reload
+        systemctl restart certbot.timer
     fi
-
-    log "[$model] curl start..."
-    curl -s --max-time 300 \
-        -X POST "$AI_API_URL" \
-        -H "content-type: application/json" \
-        -H "authorization: Bearer $AI_API_TOKEN" \
-        -H "origin: https://pollinations.ai" \
-        -H "referer: https://pollinations.ai/" \
-        -d "@$payload_file" \
-        -o "$response_file" \
-        2>> "$LOG_FILE"
-    local curl_exit=$?
-    log "[$model] curl exit=$curl_exit response_size=$(wc -c < "$response_file" 2>/dev/null || echo 0)"
-
-    rm -f "$payload_file"
-
-    if [[ $curl_exit -ne 0 ]] || [[ ! -s "$response_file" ]]; then
-        log "[$model] CURL FAILED or empty response"
-        rm -f "$response_file" "$parse_script"
-        return 1
-    fi
-
-    log "[$model] RAW (first 300): $(head -c 300 "$response_file")"
-
-    local first_bytes
-    first_bytes=$(head -c 15 "$response_file" 2>/dev/null || true)
-    if [[ "$first_bytes" != *"{"* ]]; then
-        log "[$model] Ответ не JSON: $first_bytes"
-        rm -f "$response_file" "$parse_script"
-        return 1
-    fi
-
-    cat > "$parse_script" << 'PYEOF'
-import sys, json, re
-
-with open(sys.argv[1], 'r', encoding='utf-8', errors='replace') as f:
-    raw = f.read()
-
-content = ''
-
-try:
-    data = json.loads(raw)
-
-    if 'error' in data:
-        sys.stderr.write(f"API ERROR: {data.get('error','')}\n")
-        sys.exit(1)
-
-    msg = data['choices'][0]['message']
-    content = (msg.get('content') or '').strip()
-
-    tokens = data.get('usage', {}).get('completion_tokens', '?')
-    sys.stderr.write(f"INFO: completion_tokens={tokens} content_size={len(content)}\n")
-
-    if not content:
-        rc = (msg.get('reasoning_content') or '').strip()
-        sys.stderr.write(f"INFO: content пуст, reasoning size: {len(rc)}\n")
-        if rc:
-            m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', rc, re.IGNORECASE)
-            if m:
-                content = m.group(1).strip()
-            else:
-                sys.stderr.write("ERROR: HTML не найден в reasoning\n")
-                sys.exit(1)
-
-    if not content:
-        sys.stderr.write("ERROR: content и reasoning пусты\n")
-        sys.exit(1)
-
-except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
-    sys.stderr.write(f"JSON ERROR: {e}\nRAW[:200]: {raw[:200]}\n")
-    sys.exit(1)
-
-content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
-content = re.sub(r'\n?```\s*$', '', content)
-content = content.strip()
-
-if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
-    m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', content, re.IGNORECASE)
-    if m:
-        content = m.group(1).strip()
-
-if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
-    sys.stderr.write(f"NOT HTML: {content[:200]}\n")
-    sys.exit(1)
-
-size = len(content)
-if size < 3000:
-    sys.stderr.write(f"TOO SMALL: {size} bytes\n")
-    sys.exit(1)
-
-with open(sys.argv[2], 'w', encoding='utf-8') as f:
-    f.write(content)
-sys.stderr.write(f"OK: {size} bytes written\n")
-PYEOF
-
-    python3 "$parse_script" "$response_file" "$output_file" 2>> "$LOG_FILE" || {
-        rm -f "$response_file" "$parse_script"
-        log "[$model] PARSE FAILED"
-        return 1
-    }
-
-    rm -f "$response_file" "$parse_script"
-
-    if [[ ! -s "$output_file" ]]; then
-        log "[$model] output_file пустой"
-        return 1
-    fi
-
-    log "[$model] HTML записан: $(wc -c < "$output_file") байт"
-    return 0
-}
-
-# ─── AI: перебор моделей с retry ──────────────────────────────────────────────
-
-generate_ai_site() {
-    local theme="$1"
-    local output_file="$2"
-
-    local -a models=("openai-fast" "openai" "openai-large")
-    local max_attempts=3
-    local attempt=0
-
-    while (( attempt < max_attempts )); do
-        (( attempt++ ))
-        log "Попытка $attempt/$max_attempts..."
-
-        for model in "${models[@]}"; do
-            echo -e "\r  ${BLUE}[AI]${NC} Попытка $attempt · модель: ${CYAN}${model}${NC}...                    "
-            if _try_generate "$theme" "$output_file" "$model"; then
-                log "Успех: попытка=$attempt модель=$model"
-                echo -e "\r  ${GREEN}[AI]${NC} Готово ✓  (попытка $attempt, модель ${CYAN}${model}${NC})                    "
-                return 0
-            fi
-            log "Модель $model не дала результат"
-            sleep 2
-        done
-
-        if (( attempt < max_attempts )); then
-            log "Все модели в попытке $attempt не сработали, пауза 15с..."
-            echo -e "\r  ${YELLOW}[AI]${NC} Повтор через 15 сек... (попытка $attempt/$max_attempts)                    "
-            sleep 15
-        fi
-    done
-
-    log "Все $max_attempts попыток исчерпаны"
-    return 1
-}
-
-# ─── AI: спиннер ──────────────────────────────────────────────────────────────
-
-spinner() {
-    local pid=$1
-    local start_time elapsed minutes seconds
-
-    local -a phases=(
-        "0:1:🧠  Анализирую тематику сайта..."
-        "1:2:💭  Придумываю структуру и разделы..."
-        "2:3:🎨  Выбираю цветовую палитру и стиль..."
-        "3:4:✍️   Пишу HTML-разметку..."
-        "4:5:🎭  Добавляю CSS-анимации..."
-        "5:6:⚙️   Пишу JavaScript..."
-        "6:7:🖼️   Рисую SVG-иконки и иллюстрации..."
-        "7:8:📱  Делаю адаптивную вёрстку..."
-        "8:9:✨  Полирую визуальные эффекты..."
-        "9:600:🔍  Финальная проверка и оформление..."
-    )
-
-    local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-    local frame_i=0
-    local phase_label=""
-
-    start_time=$(date +%s)
-    printf "\n\n"
-
-    while kill -0 "$pid" 2>/dev/null; do
-        elapsed=$(( $(date +%s) - start_time ))
-        minutes=$(( elapsed / 60 ))
-        seconds=$(( elapsed % 60 ))
-
-        for phase in "${phases[@]}"; do
-            local p_start p_end p_label
-            p_start="${phase%%:*}"
-            p_end="${phase#*:}"; p_end="${p_end%%:*}"
-            p_label="${phase##*:}"
-            if (( minutes >= p_start && minutes < p_end )); then
-                phase_label="$p_label"
-                break
-            fi
-        done
-
-        local max_sec=600
-        local pct=$(( elapsed * 100 / max_sec ))
-        (( pct > 99 )) && pct=99
-        local filled=$(( pct * 30 / 100 ))
-        local empty=$(( 30 - filled ))
-
-        local bar_str=""
-        local i
-        for (( i=0; i<filled; i++ )); do bar_str+="█"; done
-        for (( i=0; i<empty;  i++ )); do bar_str+="░"; done
-
-        local dot
-        (( (frame_i / 5) % 2 == 0 )) \
-            && dot="${MAGENTA}●${NC}" \
-            || dot="${BLUE}○${NC}"
-
-        local time_str eta_str
-        printf -v time_str "%02d:%02d" "$minutes" "$seconds"
-        if (( elapsed > 5 && elapsed < max_sec )); then
-            local remaining=$(( max_sec - elapsed ))
-            printf -v eta_str "ещё ~%02d:%02d" "$(( remaining/60 ))" "$(( remaining%60 ))"
-        elif (( elapsed >= max_sec )); then
-            eta_str="почти готово..."
-        else
-            eta_str="оцениваю время..."
-        fi
-
-        printf "\033[2A"
-        printf "\r  %b %s  ${CYAN}%s${NC}%60s\n" \
-            "$dot" \
-            "${frames:$((frame_i % ${#frames})):1}" \
-            "$phase_label" ""
-        printf "\r  ${CYAN}[${GREEN}%s${YELLOW}%s${CYAN}]${NC}  ${YELLOW}%s${NC}  ${BLUE}%s${NC}%30s\n" \
-            "$bar_str" "" "$time_str" "$eta_str" ""
-
-        frame_i=$(( frame_i + 1 ))
-        sleep 0.1
-    done
-
-    printf "\033[2A"
-    printf "\r%80s\n\r%80s\n" "" ""
-    printf "\033[2A"
-}
-
-# ─── Certbot автопродление ────────────────────────────────────────────────────
-
-setup_certbot_renewal() {
-    if systemctl list-timers 2>/dev/null | grep -q "certbot.timer"; then
-        systemctl enable --now certbot.timer 2>/dev/null || true
-        if ! systemctl cat certbot.timer 2>/dev/null | grep -q "Persistent=true"; then
-            mkdir -p /etc/systemd/system/certbot.timer.d/
-            cat > /etc/systemd/system/certbot.timer.d/override.conf <<'EOF'
-[Timer]
-Persistent=true
-EOF
-            systemctl daemon-reload
-            systemctl restart certbot.timer 2>/dev/null || true
-        fi
-        ok "Автопродление: systemd timer (Persistent=true)"
-    elif [[ -f /etc/cron.d/certbot ]]; then
-        ok "Автопродление: cron (уже настроен)"
-    else
-        cat > /etc/cron.d/certbot <<'EOF'
+    show_complete "Автопродление настроено (systemd timer + Persistent)"
+elif [ -f /etc/cron.d/certbot ]; then
+    show_complete "Автопродление настроено (cron)"
+else
+    cat > /etc/cron.d/certbot <<'CRONEOF'
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 0 */12 * * * root certbot -q renew --nginx
-EOF
-        ok "Автопродление: cron (создан)"
-    fi
-    run "certbot renew --dry-run" || warn "dry-run завершился с ошибкой (некритично)"
-}
+CRONEOF
+    show_complete "Автопродление настроено (новый cron)"
+fi
+execute_silent "certbot renew --dry-run" || true
 
-# ─── Nginx конфиг ─────────────────────────────────────────────────────────────
+# Шаг 12: Конфигурация Nginx
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Создание конфигурации Nginx..."
 
-write_nginx_config() {
-    local domain=$1 sport=$2 conf_path=$3
-
-    local nginx_ver major minor
-    nginx_ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    major=$(echo "$nginx_ver" | cut -d. -f1)
-    minor=$(echo "$nginx_ver" | cut -d. -f2)
-
-    local http2_listen http2_directive
-    if (( major > 1 || ( major == 1 && minor >= 25 ) )); then
-        http2_listen="ssl"
-        http2_directive="    http2 on;"
-    else
-        http2_listen="ssl http2"
-        http2_directive=""
-    fi
-
-    log "Nginx $nginx_ver: используем '$http2_listen'"
-
-    cat > "$conf_path" <<EOF
+cat > /etc/nginx/sites-enabled/sni.conf <<EOF
 server {
     listen 80;
-    server_name $domain;
-
-    location /.well-known/acme-challenge/ {
-        root $WEBROOT;
-    }
-
-    location / {
+    server_name $DOMAIN;
+    if (\$host = $DOMAIN) {
         return 301 https://\$host\$request_uri;
     }
+    return 404;
 }
 
 server {
-    listen 127.0.0.1:${sport} ${http2_listen};
-${http2_directive}
-    server_name $domain;
+    listen 127.0.0.1:$SPORT ssl http2;
+    server_name $DOMAIN;
 
-    ssl_certificate     /etc/letsencrypt/live/$domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 
-    ssl_protocols           TLSv1.2 TLSv1.3;
+    ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers on;
-    ssl_ciphers             ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
-    ssl_session_cache       shared:SSL:10m;
-    ssl_session_timeout     1d;
-    ssl_session_tickets     off;
+    ssl_ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384";
 
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
-    add_header X-Frame-Options DENY always;
-    add_header X-Content-Type-Options nosniff always;
+    ssl_stapling on;
+    ssl_stapling_verify on;
 
-    real_ip_header   proxy_protocol;
+    resolver 8.8.8.8 8.8.4.4 valid=300s;
+    resolver_timeout 5s;
+
+    real_ip_header proxy_protocol;
     set_real_ip_from 127.0.0.1;
 
     location / {
-        root  $WEBROOT;
-        index index.html index.htm;
-        try_files \$uri \$uri/ =404;
+        root /var/www/html;
+        index index.html;
     }
 }
 EOF
-}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ТОЧКА ВХОДА
-# ═══════════════════════════════════════════════════════════════════════════════
+rm -f /etc/nginx/sites-enabled/default
+show_complete "Конфигурация Nginx создана"
 
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
-log "=== $SCRIPT_NAME v$SCRIPT_VERSION started ==="
-
-clear
-echo -e "${CYAN}╔═════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   $SCRIPT_NAME v$SCRIPT_VERSION by begugla      ║${NC}"
-echo -e "${CYAN}╚═════════════════════════════════════════════════════╝${NC}"
-echo ""
-
-require_root
-
-step "Проверка операционной системы..."
-detect_os
-
-step "Ожидание ввода данных..."
-echo ""
-
-set +e
-read -rp "  Введите доменное имя:                           " DOMAIN
-read -rp "  Email для Let's Encrypt (Enter = admin@$DOMAIN): " LE_EMAIL
-read -rp "  Внутренний SNI порт        (Enter = 9000):       " SPORT
-echo ""
-echo -e "  ${CYAN}Тематика определяет что AI сгенерирует для сайта.${NC}"
-echo -e "  ${YELLOW}Примеры:${NC} ремонт квартир, юридические услуги, кофейня,"
-echo -e "           IT-компания, фитнес-клуб, медицинская клиника"
-echo ""
-read -rp "  Тематика сайта             (Enter = IT-компания): " SITE_THEME
-set -e
-
-LE_EMAIL="${LE_EMAIL:-"admin@$DOMAIN"}"
-SPORT="${SPORT:-9000}"
-SITE_THEME="${SITE_THEME:-IT-компания}"
-
-[[ -z "$DOMAIN" ]] && die "Доменное имя не может быть пустым"
-validate_domain "$DOMAIN"
-validate_port "$SPORT"
-
-ok "Параметры: домен=$DOMAIN  порт=$SPORT  тема=\"$SITE_THEME\""
-log "Параметры: DOMAIN=$DOMAIN LE_EMAIL=$LE_EMAIL SPORT=$SPORT SITE_THEME=$SITE_THEME"
-
-step "Обновление списка пакетов..."
-wait_apt_lock
-run "apt-get update -qq" || die "Не удалось обновить список пакетов"
-ok "Список пакетов обновлён"
-
-step "Установка зависимостей..."
-PACKAGES=(nginx certbot python3-certbot-nginx curl dnsutils python3)
-run "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${PACKAGES[*]}" \
-    || die "Не удалось установить: ${PACKAGES[*]}"
-ok "Установлено: ${PACKAGES[*]}"
-
-step "Определение внешнего IP..."
-EXTERNAL_IP=$(get_external_ip) || die "Не удалось определить внешний IP"
-ok "Внешний IP: $EXTERNAL_IP"
-
-step "Проверка A-записи $DOMAIN..."
-DOMAIN_IP=$(dig +short A "$DOMAIN" @1.1.1.1 | grep -E '^[0-9.]+$' | head -n1 || true)
-[[ -z "$DOMAIN_IP" ]] && die "A-запись для $DOMAIN не найдена" "$GITHUB_URL"
-ok "DNS A-запись: $DOMAIN_IP"
-
-step "Проверка соответствия DNS ↔ IP сервера..."
-[[ "$DOMAIN_IP" != "$EXTERNAL_IP" ]] \
-    && die "DNS ($DOMAIN_IP) ≠ IP сервера ($EXTERNAL_IP). Обновите A-запись." "$GITHUB_URL"
-ok "DNS корректен: $DOMAIN_IP = $EXTERNAL_IP"
-
-step "Остановка nginx..."
-systemctl stop nginx 2>/dev/null || true
-ok "Nginx остановлен"
-
-step "Проверка доступности портов 80/443..."
-check_port_free 80
-check_port_free 443
-ok "Порты 80 и 443 свободны"
-
-step "Генерация сайта через AI (тема: \"$SITE_THEME\")..."
-echo -e "\n  ${CYAN}Запрос отправлен. AI думает — это может занять до 5 минут.${NC}"
-
-AI_HTML_FILE=$(mktemp /tmp/ai_site_XXXXXX.html)
-FALLBACK_USED=false
-
-set +e
-generate_ai_site "$SITE_THEME" "$AI_HTML_FILE" &
-AI_PID=$!
-spinner "$AI_PID"
-wait "$AI_PID"
-AI_EXIT=$?
-set -e
-
-if [[ $AI_EXIT -eq 0 ]] && [[ -s "$AI_HTML_FILE" ]]; then
-    rm -rf "${WEBROOT:?}"/*
-    cp "$AI_HTML_FILE" "$WEBROOT/index.html"
-    chmod 644 "$WEBROOT/index.html"
-    HTML_SIZE=$(wc -c < "$WEBROOT/index.html")
-    ok "AI сайт сгенерирован и установлен (${HTML_SIZE} байт)"
+# Шаг 13: Запуск Nginx
+CURRENT_STEP=$((CURRENT_STEP + 1))
+show_progress $CURRENT_STEP $TOTAL_STEPS "Запуск Nginx..."
+if nginx -t > /dev/null 2>&1 && systemctl start nginx > /dev/null 2>&1; then
+    show_complete "Nginx успешно запущен"
 else
-    warn "AI не дал результат — используется страница-заглушка"
-    echo -e "  ${YELLOW}Подробности в логе: $LOG_FILE${NC}"
-    echo -e "  ${BLUE}Последние записи лога:${NC}"
-    grep -i "ai\|curl\|parse\|html\|raw\|error\|модел\|reasoning\|exit" "$LOG_FILE" 2>/dev/null \
-        | tail -10 \
-        | while read -r line; do
-            echo -e "  ${YELLOW}→${NC} $line"
-          done
-    FALLBACK_USED=true
-    cat > "$WEBROOT/index.html" <<'FALLBACK'
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Welcome</title>
-<style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{
-    min-height:100vh;display:flex;align-items:center;justify-content:center;
-    background:linear-gradient(135deg,#0b1120,#1a2340);
-    font-family:system-ui,sans-serif;color:#e2e8f0;
-  }
-  .card{
-    text-align:center;padding:48px 40px;
-    background:rgba(255,255,255,.05);
-    border:1px solid rgba(255,255,255,.1);
-    border-radius:16px;
-    animation:fadeIn .8s ease;
-  }
-  h1{font-size:2rem;margin-bottom:12px}
-  p{color:#94a3b8}
-  @keyframes fadeIn{
-    from{opacity:0;transform:translateY(20px)}
-    to{opacity:1;transform:none}
-  }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>🚀 Server is running</h1>
-    <p>Configured successfully.</p>
-  </div>
-</body>
-</html>
-FALLBACK
-fi
-rm -f "$AI_HTML_FILE"
-
-step "Получение SSL сертификата..."
-run "certbot certonly --standalone -d $DOMAIN --agree-tos -m $LE_EMAIL --non-interactive" \
-    || die "Не удалось получить SSL. Проверьте DNS и порты." "$GITHUB_URL"
-ok "SSL сертификат получен"
-setup_certbot_renewal
-
-step "Создание конфигурации Nginx..."
-CONF_PATH="$NGINX_CONF_DIR/sni_${DOMAIN}.conf"
-write_nginx_config "$DOMAIN" "$SPORT" "$CONF_PATH"
-rm -f "$NGINX_CONF_DIR/default"
-ok "Конфиг записан: $CONF_PATH"
-
-step "Запуск Nginx..."
-nginx -t >> "$LOG_FILE" 2>&1 \
-    || die "Конфигурация Nginx содержит ошибки. Лог: $LOG_FILE"
-systemctl enable --now nginx >> "$LOG_FILE" 2>&1 \
-    || die "Не удалось запустить Nginx. Лог: $LOG_FILE"
-ok "Nginx запущен и добавлен в автозагрузку"
-
-step "Финальная проверка сервера..."
-sleep 1
-set +e
-curl -sk --max-time 5 "https://127.0.0.1:$SPORT" -H "Host: $DOMAIN" -o /dev/null
-CURL_EXIT=$?
-set -e
-if [[ $CURL_EXIT -eq 0 ]]; then
-    ok "Сервер отвечает на 127.0.0.1:$SPORT"
-else
-    warn "Сервер не ответил на тестовый запрос (возможно, нужен proxy_protocol)"
+    show_error "Ошибка при запуске Nginx"
+    exit 1
 fi
 
 echo ""
-echo -e "${CYAN}╔═════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║              Установка завершена!                   ║${NC}"
-echo -e "${CYAN}╚═════════════════════════════════════════════════════╝${NC}"
+echo -e "${CYAN}=====================================================${NC}"
+echo -e "${CYAN}          Установка завершена успешно!              ${NC}"
+echo -e "${CYAN}=====================================================${NC}"
 echo ""
-echo -e "${GREEN}Параметры подключения:${NC}"
-echo -e "${BLUE}──────────────────────────────────────────────────────${NC}"
-echo -e " ${YELLOW}SNI домен:${NC}    $DOMAIN"
-echo -e " ${YELLOW}Dest:${NC}         127.0.0.1:$SPORT"
-echo -e " ${YELLOW}Сертификат:${NC}   /etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-echo -e " ${YELLOW}Ключ:${NC}         /etc/letsencrypt/live/$DOMAIN/privkey.pem"
-echo -e " ${YELLOW}Тема сайта:${NC}   $SITE_THEME"
-if $FALLBACK_USED; then
-    echo -e " ${YELLOW}Сайт:${NC}         заглушка (AI недоступен)"
-else
-    echo -e " ${YELLOW}Сайт:${NC}         AI-сгенерирован ✓"
-fi
-echo -e " ${YELLOW}Лог:${NC}          $LOG_FILE"
-echo -e "${BLUE}──────────────────────────────────────────────────────${NC}"
+echo -e "${GREEN}Параметры для подключения:${NC}"
+echo -e "${BLUE}-----------------------------------------------------${NC}"
+echo -e " ${YELLOW}Сертификат:${NC} /etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+echo -e " ${YELLOW}Ключ:${NC}        /etc/letsencrypt/live/$DOMAIN/privkey.pem"
+echo -e " ${YELLOW}Dest:${NC}        127.0.0.1:$SPORT"
+echo -e " ${YELLOW}SNI:${NC}         $DOMAIN"
+echo -e " ${YELLOW}Тема сайта:${NC}  $THEME"
+echo -e "${BLUE}-----------------------------------------------------${NC}"
 echo ""
+echo -e "${GREEN}Скрипт завершен!${NC}"
