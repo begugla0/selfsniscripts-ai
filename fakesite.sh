@@ -314,7 +314,7 @@ generate_ai_site() {
     local theme="$1"
     local output_file="$2"
 
-    local -a models=("gpt-5-nano-2025-08-07" "openai-fast" "openai")
+    local -a models=("openai-fast" "openai")
 
     for model in "${models[@]}"; do
         echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...                    "
