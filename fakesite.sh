@@ -11,13 +11,14 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # ─── Константы ────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.1.0"
 SCRIPT_NAME="Self SNI Scripts"
 GITHUB_URL="https://github.com/begugla0/selfsniscripts"
 LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
 NGINX_CONF_DIR="/etc/nginx/sites-enabled"
 WEBROOT="/var/www/html"
-AI_API_URL="https://text.pollinations.ai/openai"
+AI_API_URL="https://gen.pollinations.ai/v1/chat/completions"
+AI_API_TOKEN="pk_XDXnwCpYbihkQcEg"
 
 TOTAL_STEPS=14
 CURRENT_STEP=0
@@ -99,20 +100,11 @@ validate_domain() {
 
 validate_port() {
     local port="${1:-}"
-    if [[ -z "$port" ]]; then
-        die "Порт не может быть пустым"
-    fi
-    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-        die "Порт должен быть числом: $port"
-    fi
-    local port_num
-    port_num=$(( port + 0 )) || die "Ошибка преобразования порта"
-    if [[ $port_num -lt 1 ]] || [[ $port_num -gt 65535 ]]; then
-        die "Некорректный порт: $port (допустимо 1–65535)"
-    fi
-    if [[ $port_num -lt 1024 ]]; then
-        warn "Порт $port < 1024 — привилегированный."
-    fi
+    [[ -z "$port" ]] && die "Порт не может быть пустым"
+    [[ "$port" =~ ^[0-9]+$ ]] || die "Порт должен быть числом: $port"
+    local port_num=$(( port + 0 ))
+    [[ $port_num -lt 1 || $port_num -gt 65535 ]] && die "Некорректный порт: $port (допустимо 1–65535)"
+    [[ $port_num -lt 1024 ]] && warn "Порт $port < 1024 — привилегированный."
 }
 
 get_external_ip() {
@@ -133,9 +125,7 @@ check_port_free() {
     local port="$1"
     local result
     result=$(ss -tuln 2>/dev/null | grep -c ":${port} \|:${port}$" || true)
-    if [[ "$result" -gt 0 ]]; then
-        die "Порт $port занят. Освободите его перед установкой." "$GITHUB_URL"
-    fi
+    [[ "$result" -gt 0 ]] && die "Порт $port занят. Освободите его перед установкой." "$GITHUB_URL"
 }
 
 # ─── AI: промт ────────────────────────────────────────────────────────────────
@@ -143,8 +133,6 @@ check_port_free() {
 build_ai_prompt() {
     local theme="$1"
     cat <<EOF
-IMPORTANT: Do NOT think out loud. Do NOT reason. Output ONLY the final HTML immediately.
-
 You are an expert front-end developer. Generate a complete, production-ready single-file website for the following theme: "${theme}".
 
 STRICT OUTPUT RULES — FOLLOW EXACTLY:
@@ -152,7 +140,6 @@ STRICT OUTPUT RULES — FOLLOW EXACTLY:
 - Do NOT wrap in markdown fences.
 - Do NOT add any explanation, commentary, preamble, or text outside the HTML.
 - Do NOT include HTML comments.
-- Do NOT think before answering. Just output HTML directly.
 
 DESIGN REQUIREMENTS:
 - Single .html file: all CSS in <style>, all JS in <script> — no external CDN links.
@@ -214,6 +201,9 @@ print(json.dumps({
     curl -s --max-time 300 \
         -X POST "$AI_API_URL" \
         -H "content-type: application/json" \
+        -H "authorization: Bearer $AI_API_TOKEN" \
+        -H "origin: https://pollinations.ai" \
+        -H "referer: https://pollinations.ai/" \
         -d "@$payload_file" \
         -o "$response_file" \
         2>> "$LOG_FILE"
@@ -233,7 +223,7 @@ print(json.dumps({
     local first_bytes
     first_bytes=$(head -c 15 "$response_file" 2>/dev/null || true)
     if [[ "$first_bytes" != *"{"* ]]; then
-        log "[$model] Ответ не JSON (502/nginx error): $first_bytes"
+        log "[$model] Ответ не JSON: $first_bytes"
         rm -f "$response_file" "$parse_script"
         return 1
     fi
@@ -256,6 +246,9 @@ try:
     msg = data['choices'][0]['message']
     content = (msg.get('content') or '').strip()
 
+    tokens = data.get('usage', {}).get('completion_tokens', '?')
+    sys.stderr.write(f"INFO: completion_tokens={tokens} content_size={len(content)}\n")
+
     if not content:
         rc = (msg.get('reasoning_content') or '').strip()
         sys.stderr.write(f"INFO: content пуст, reasoning size: {len(rc)}\n")
@@ -264,15 +257,12 @@ try:
             if m:
                 content = m.group(1).strip()
             else:
-                sys.stderr.write(f"ERROR: HTML не найден в reasoning\n")
+                sys.stderr.write("ERROR: HTML не найден в reasoning\n")
                 sys.exit(1)
 
     if not content:
         sys.stderr.write("ERROR: content и reasoning пусты\n")
         sys.exit(1)
-
-    tokens = data.get('usage', {}).get('completion_tokens', '?')
-    sys.stderr.write(f"INFO: completion_tokens={tokens}\n")
 
 except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
     sys.stderr.write(f"JSON ERROR: {e}\nRAW[:200]: {raw[:200]}\n")
@@ -324,7 +314,7 @@ generate_ai_site() {
     local theme="$1"
     local output_file="$2"
 
-    local -a models=("openai-fast" "openai" "mistral")
+    local -a models=("openai-fast" "openai" "openai-large")
     local max_attempts=3
     local attempt=0
 
@@ -345,7 +335,7 @@ generate_ai_site() {
 
         if (( attempt < max_attempts )); then
             log "Все модели в попытке $attempt не сработали, пауза 15с..."
-            echo -e "\r  ${YELLOW}[AI]${NC} Сервис недоступен, повтор через 15 сек... (попытка $attempt/$max_attempts)                    "
+            echo -e "\r  ${YELLOW}[AI]${NC} Повтор через 15 сек... (попытка $attempt/$max_attempts)                    "
             sleep 15
         fi
     done
@@ -544,7 +534,7 @@ log "=== $SCRIPT_NAME v$SCRIPT_VERSION started ==="
 
 clear
 echo -e "${CYAN}╔═════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   $SCRIPT_NAME v$SCRIPT_VERSION by begugla       ║${NC}"
+echo -e "${CYAN}║   $SCRIPT_NAME v$SCRIPT_VERSION by begugla      ║${NC}"
 echo -e "${CYAN}╚═════════════════════════════════════════════════════╝${NC}"
 echo ""
 
