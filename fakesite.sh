@@ -11,14 +11,13 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # ─── Константы ────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.5.0"
 SCRIPT_NAME="Self SNI Scripts"
 GITHUB_URL="https://github.com/begugla0/selfsniscripts"
 LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
 NGINX_CONF_DIR="/etc/nginx/sites-enabled"
 WEBROOT="/var/www/html"
 AI_API_URL="https://text.pollinations.ai/openai"
-AI_MODEL="openai"
 
 TOTAL_STEPS=14
 CURRENT_STEP=0
@@ -165,11 +164,71 @@ DESIGN REQUIREMENTS:
 EOF
 }
 
-# ─── AI: запрос и парсинг ─────────────────────────────────────────────────────
+# ─── AI: парсер HTML из ответа ────────────────────────────────────────────────
 
-generate_ai_site() {
+_parse_ai_response() {
+    python3 << 'PYEOF'
+import json, sys, re
+
+raw = sys.stdin.read()
+content = ''
+
+try:
+    data = json.loads(raw)
+    msg = data['choices'][0]['message']
+
+    # Сначала content
+    content = (msg.get('content') or '').strip()
+
+    # Думающие модели — HTML в reasoning_content
+    if not content:
+        rc = (msg.get('reasoning_content') or '').strip()
+        if rc:
+            sys.stderr.write("INFO: content пуст, ищем HTML в reasoning_content\n")
+            m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', rc, re.IGNORECASE)
+            if m:
+                content = m.group(1).strip()
+                sys.stderr.write(f"INFO: HTML найден в reasoning_content ({len(content)} chars)\n")
+            else:
+                sys.stderr.write(f"ERROR: HTML не найден в reasoning_content\nRC: {rc[:300]}\n")
+                sys.exit(1)
+
+    if not content:
+        sys.stderr.write("ERROR: content и reasoning_content пусты\n")
+        sys.exit(1)
+
+except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+    sys.stderr.write(f"JSON PARSE ERROR: {e}\nRAW: {raw[:300]}\n")
+    content = raw.strip()
+
+# Убираем markdown-обёртку
+content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
+content = re.sub(r'\n?```\s*$', '', content)
+content = content.strip()
+
+# Ищем HTML если он в середине текста
+if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
+    m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', content, re.IGNORECASE)
+    if m:
+        content = m.group(1).strip()
+        sys.stderr.write("INFO: HTML извлечён из середины текста\n")
+
+# Финальная проверка
+if content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE):
+    print(content)
+    sys.exit(0)
+
+sys.stderr.write(f"NOT HTML. Start: {content[:200]}\n")
+sys.exit(1)
+PYEOF
+}
+
+# ─── AI: попытка с одной моделью ─────────────────────────────────────────────
+
+_try_generate() {
     local theme="$1"
     local output_file="$2"
+    local model="$3"
 
     local prompt
     prompt=$(build_ai_prompt "$theme")
@@ -178,88 +237,66 @@ generate_ai_site() {
     payload=$(python3 -c "
 import json, sys
 prompt = sys.stdin.read()
-payload = {
-    'model': '${AI_MODEL}',
+print(json.dumps({
+    'model': '$model',
     'messages': [{'role': 'user', 'content': prompt}],
     'stream': False
-}
-print(json.dumps(payload))
-" <<< "$prompt") || { log "PAYLOAD BUILD FAILED"; return 1; }
+}))
+" <<< "$prompt") || { log "[$model] PAYLOAD BUILD FAILED"; return 1; }
 
-    log "AI запрос отправлен (тема: $theme, модель: ${AI_MODEL})"
+    log "[$model] Отправляем запрос..."
 
     local response
-    response=$(curl -s --max-time 600 \
+    response=$(curl -s --max-time 120 \
         -X POST "$AI_API_URL" \
         -H "content-type: application/json" \
-        -d "$payload") || { log "CURL FAILED (exit $?)"; return 1; }
+        -d "$payload") || { log "[$model] CURL FAILED"; return 1; }
 
-    log "AI RAW RESPONSE (first 500): ${response:0:500}"
+    log "[$model] RAW (first 400): ${response:0:400}"
 
     if [[ -z "$response" ]]; then
-        log "AI ERROR: пустой ответ от API"
+        log "[$model] Пустой ответ"
         return 1
     fi
 
     local html
-    html=$(python3 << 'PYEOF'
-import json, sys, re
-
-raw = sys.stdin.read()
-
-try:
-    data = json.loads(raw)
-    msg = data['choices'][0]['message']
-
-    # Сначала пробуем content
-    content = (msg.get('content') or '').strip()
-
-    # Думающие модели могут класть ответ в reasoning_content
-    if not content:
-        content = (msg.get('reasoning_content') or '').strip()
-        if content:
-            sys.stderr.write("INFO: использован reasoning_content\n")
-
-    if not content:
-        sys.stderr.write(f"ERROR: content и reasoning_content пусты\nFULL MSG: {json.dumps(msg)[:500]}\n")
-        sys.exit(1)
-
-except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
-    sys.stderr.write(f"JSON PARSE ERROR: {e}\nRAW START: {raw[:300]}\n")
-    content = raw.strip()
-
-# Убираем markdown-обёртку
-content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
-content = re.sub(r'\n?```\s*$', '', content)
-content = content.strip()
-
-# Ищем HTML если он внутри текста
-if not (content.lower().startswith('<!doctype') or '<html' in content.lower()):
-    html_match = re.search(r'(<!DOCTYPE\s+html.*)', content, re.IGNORECASE | re.DOTALL)
-    if html_match:
-        content = html_match.group(1).strip()
-        sys.stderr.write("INFO: HTML извлечён из середины текста\n")
-
-if content.lower().startswith('<!doctype') or '<html' in content.lower():
-    print(content)
-    sys.exit(0)
-else:
-    sys.stderr.write(f"NOT HTML. Content start: {content[:300]}\n")
-    sys.exit(1)
-PYEOF
-<<< "$response") || {
-        log "AI PARSE FAILED. RAW начало: ${response:0:300}"
+    html=$(_parse_ai_response <<< "$response") || {
+        log "[$model] PARSE FAILED"
         return 1
     }
 
     if [[ -z "$html" ]]; then
-        log "AI ERROR: html пустой после парсинга"
+        log "[$model] HTML пустой после парсинга"
         return 1
     fi
 
     echo "$html" > "$output_file"
-    log "AI HTML записан: $(wc -c < "$output_file") байт"
+    log "[$model] HTML записан: $(wc -c < "$output_file") байт"
     return 0
+}
+
+# ─── AI: главная функция с перебором моделей ─────────────────────────────────
+
+generate_ai_site() {
+    local theme="$1"
+    local output_file="$2"
+
+    # Модели от не-думающих к думающим
+    local -a models=("mistral" "openai" "claude-email" "llama")
+
+    for model in "${models[@]}"; do
+        echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...${YELLOW}                    ${NC}"
+        if _try_generate "$theme" "$output_file" "$model"; then
+            log "Успех с моделью: $model"
+            echo -e "\r  ${GREEN}[AI]${NC} Модель ${CYAN}${model}${NC} сработала ✓${YELLOW}                    ${NC}"
+            return 0
+        fi
+        log "Модель $model не дала результат, пробуем следующую..."
+        sleep 1
+    done
+
+    log "Все модели исчерпаны"
+    return 1
 }
 
 # ─── AI: спиннер ──────────────────────────────────────────────────────────────
@@ -381,7 +418,6 @@ EOF
 write_nginx_config() {
     local domain=$1 sport=$2 conf_path=$3
 
-    # Определяем синтаксис http2 по версии nginx
     local nginx_ver major minor
     nginx_ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     major=$(echo "$nginx_ver" | cut -d. -f1)
@@ -389,16 +425,14 @@ write_nginx_config() {
 
     local http2_listen http2_directive
     if (( major > 1 || ( major == 1 && minor >= 25 ) )); then
-        # nginx >= 1.25.1 — новый синтаксис
         http2_listen="ssl"
         http2_directive="    http2 on;"
     else
-        # nginx < 1.25.1 — старый синтаксис
         http2_listen="ssl http2"
         http2_directive=""
     fi
 
-    log "Nginx $nginx_ver: http2_listen='$http2_listen'"
+    log "Nginx $nginx_ver: используем '$http2_listen'"
 
     cat > "$conf_path" <<EOF
 # Сгенерировано $SCRIPT_NAME v$SCRIPT_VERSION — $(date)
@@ -563,11 +597,11 @@ if [[ $AI_EXIT -eq 0 ]] && [[ -s "$AI_HTML_FILE" ]]; then
     HTML_SIZE=$(wc -c < "$WEBROOT/index.html")
     ok "AI сайт сгенерирован и установлен (${HTML_SIZE} байт)"
 else
-    warn "AI вернул некорректный ответ — используется страница-заглушка"
+    warn "Все AI модели не дали результат — используется страница-заглушка"
     echo -e "  ${YELLOW}Подробности в логе: $LOG_FILE${NC}"
     echo -e "  ${BLUE}Последние записи лога:${NC}"
-    grep -i "ai\|curl\|parse\|html\|raw\|error" "$LOG_FILE" 2>/dev/null \
-        | tail -5 \
+    grep -i "ai\|curl\|parse\|html\|raw\|error\|модел" "$LOG_FILE" 2>/dev/null \
+        | tail -8 \
         | while read -r line; do
             echo -e "  ${YELLOW}→${NC} $line"
           done
