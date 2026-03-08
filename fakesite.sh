@@ -11,7 +11,7 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # ─── Константы ────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.3.0"
 SCRIPT_NAME="Self SNI Scripts"
 GITHUB_URL="https://github.com/begugla0/selfsniscripts"
 LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
@@ -183,7 +183,7 @@ payload = {
     'messages': [{'role': 'user', 'content': prompt}]
 }
 print(json.dumps(payload))
-" <<< "$prompt") || return 1
+" <<< "$prompt") || { log "PAYLOAD BUILD FAILED"; return 1; }
 
     log "AI запрос отправлен (тема: $theme)"
 
@@ -191,34 +191,54 @@ print(json.dumps(payload))
     response=$(curl -s --max-time 600 \
         -X POST "$AI_API_URL" \
         -H "content-type: application/json" \
-        -d "$payload") || return 1
+        -d "$payload") || { log "CURL FAILED (exit $?)"; return 1; }
 
-    log "AI ответ получён (длина: ${#response})"
+    # Логируем сырой ответ для диагностики
+    log "AI RAW RESPONSE (first 500): ${response:0:500}"
+
+    if [[ -z "$response" ]]; then
+        log "AI ERROR: пустой ответ от API"
+        return 1
+    fi
 
     local html
-    html=$(python3 -c "
+    html=$(python3 << 'PYEOF'
 import json, sys, re
 
 raw = sys.stdin.read()
+
 try:
     data = json.loads(raw)
     content = data['choices'][0]['message']['content']
-except Exception as e:
-    print('PARSE_ERROR: ' + str(e), file=sys.stderr)
-    sys.exit(1)
+except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+    sys.stderr.write(f"JSON PARSE ERROR: {e}\nRAW START: {raw[:300]}\n")
+    # Пробуем использовать raw напрямую если это уже HTML
+    content = raw.strip()
 
-content = re.sub(r'^\s*\`\`\`(?:html)?\s*', '', content, flags=re.IGNORECASE)
-content = re.sub(r'\s*\`\`\`\s*$', '', content)
+# Убираем markdown-обёртку если модель всё же добавила
+content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
+content = re.sub(r'\n?```\s*$', '', content)
 content = content.strip()
 
-if not content.lower().startswith('<!doctype') and '<html' not in content.lower():
-    print('NOT_HTML', file=sys.stderr)
+if content.lower().startswith('<!doctype') or '<html' in content.lower():
+    print(content)
+    sys.exit(0)
+else:
+    sys.stderr.write(f"NOT HTML. Content start: {content[:300]}\n")
     sys.exit(1)
+PYEOF
+<<< "$response") || {
+        log "AI PARSE FAILED. RAW начало: ${response:0:300}"
+        return 1
+    }
 
-print(content)
-" <<< "$response") || return 1
+    if [[ -z "$html" ]]; then
+        log "AI ERROR: html пустой после парсинга"
+        return 1
+    fi
 
     echo "$html" > "$output_file"
+    log "AI HTML записан: $(wc -c < "$output_file") байт"
     return 0
 }
 
@@ -418,9 +438,7 @@ detect_os
 step "Ожидание ввода данных..."
 echo ""
 
-# Отключаем set -e на время интерактивного ввода
 set +e
-
 read -rp "  Введите доменное имя:                           " DOMAIN
 read -rp "  Email для Let's Encrypt (Enter = admin@$DOMAIN): " LE_EMAIL
 read -rp "  Внутренний SNI порт        (Enter = 9000):       " SPORT
@@ -430,16 +448,12 @@ echo -e "  ${YELLOW}Примеры:${NC} ремонт квартир, юриди
 echo -e "           IT-компания, фитнес-клуб, медицинская клиника"
 echo ""
 read -rp "  Тематика сайта             (Enter = IT-компания): " SITE_THEME
+set -e
 
-# Подставляем дефолты
 LE_EMAIL="${LE_EMAIL:-"admin@$DOMAIN"}"
 SPORT="${SPORT:-9000}"
 SITE_THEME="${SITE_THEME:-IT-компания}"
 
-# Возвращаем set -e
-set -e
-
-# Теперь валидируем
 [[ -z "$DOMAIN" ]] && die "Доменное имя не может быть пустым"
 validate_domain "$DOMAIN"
 validate_port "$SPORT"
@@ -511,6 +525,11 @@ if [[ $AI_EXIT -eq 0 ]] && [[ -s "$AI_HTML_FILE" ]]; then
     ok "AI сайт сгенерирован и установлен (${HTML_SIZE} байт)"
 else
     warn "AI вернул некорректный ответ — используется страница-заглушка"
+    echo -e "  ${YELLOW}Подробности в логе: $LOG_FILE${NC}"
+    echo -e "  ${BLUE}Последние записи лога:${NC}"
+    grep -i "ai\|curl\|parse\|html\|raw\|error" "$LOG_FILE" 2>/dev/null | tail -5 | while read -r line; do
+        echo -e "  ${YELLOW}→${NC} $line"
+    done
     FALLBACK_USED=true
     cat > "$WEBROOT/index.html" <<'FALLBACK'
 <!DOCTYPE html>
