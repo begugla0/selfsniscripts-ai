@@ -11,13 +11,12 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # ─── Константы ────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.7.0"
 SCRIPT_NAME="Self SNI Scripts"
 GITHUB_URL="https://github.com/begugla0/selfsniscripts"
 LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
 NGINX_CONF_DIR="/etc/nginx/sites-enabled"
 WEBROOT="/var/www/html"
-AI_API_URL="https://text.pollinations.ai/openai"
 
 TOTAL_STEPS=14
 CURRENT_STEP=0
@@ -164,7 +163,7 @@ DESIGN REQUIREMENTS:
 EOF
 }
 
-# ─── AI: попытка с одной моделью ─────────────────────────────────────────────
+# ─── AI: попытка генерации ────────────────────────────────────────────────────
 
 _try_generate() {
     local theme="$1"
@@ -174,30 +173,44 @@ _try_generate() {
     local prompt
     prompt=$(build_ai_prompt "$theme")
 
-    local response_file parse_script
-    response_file=$(mktemp /tmp/ai_response_XXXXXX.html)
+    local payload_file response_file parse_script
+    payload_file=$(mktemp /tmp/ai_payload_XXXXXX.json)
+    response_file=$(mktemp /tmp/ai_response_XXXXXX.json)
     parse_script=$(mktemp /tmp/ai_parser_XXXXXX.py)
 
-    # Кодируем промт для URL
-    local encoded_prompt
-    encoded_prompt=$(python3 -c "
-import urllib.parse, sys
-print(urllib.parse.quote(sys.stdin.read(), safe=''))
-" <<< "$prompt")
-
     local rand_seed=$(( RANDOM * RANDOM ))
-    log "[$model] GET запрос (seed=$rand_seed)..."
 
-    # GET API — plain text, никакого JSON и reasoning_content
-    curl -s --max-time 180 \
-        "https://text.pollinations.ai/${encoded_prompt}?model=${model}&seed=${rand_seed}" \
-        -o "$response_file" || {
-        log "[$model] CURL FAILED"
-        rm -f "$response_file" "$parse_script"
+    python3 -c "
+import json, sys
+prompt = sys.stdin.read()
+print(json.dumps({
+    'model': '$model',
+    'messages': [{'role': 'user', 'content': prompt}],
+    'stream': False,
+    'seed': $rand_seed,
+    'max_tokens': 16000
+}))
+" <<< "$prompt" > "$payload_file" || {
+        log "[$model] PAYLOAD BUILD FAILED"
+        rm -f "$payload_file" "$response_file" "$parse_script"
         return 1
     }
 
-    log "[$model] RAW (first 300): $(head -c 300 "$response_file")"
+    log "[$model] POST запрос (seed=$rand_seed, max_tokens=16000)..."
+
+    curl -s --max-time 300 \
+        -X POST "https://text.pollinations.ai/openai" \
+        -H "content-type: application/json" \
+        -d "@$payload_file" \
+        -o "$response_file" || {
+        log "[$model] CURL FAILED"
+        rm -f "$payload_file" "$response_file" "$parse_script"
+        return 1
+    }
+
+    rm -f "$payload_file"
+    log "[$model] RAW size: $(wc -c < "$response_file") bytes"
+    log "[$model] RAW (first 400): $(head -c 400 "$response_file")"
 
     if [[ ! -s "$response_file" ]]; then
         log "[$model] Пустой ответ"
@@ -206,19 +219,49 @@ print(urllib.parse.quote(sys.stdin.read(), safe=''))
     fi
 
     cat > "$parse_script" << 'PYEOF'
-import sys, re
-
-MIN_SIZE = 10000
+import sys, json, re
 
 with open(sys.argv[1], 'r', encoding='utf-8', errors='replace') as f:
-    content = f.read().strip()
+    raw = f.read()
 
-# Убираем markdown
+content = ''
+
+try:
+    data = json.loads(raw)
+
+    if 'error' in data:
+        sys.stderr.write(f"API ERROR: {data.get('error','')}\n")
+        sys.exit(1)
+
+    msg = data['choices'][0]['message']
+    content = (msg.get('content') or '').strip()
+
+    if not content:
+        rc = (msg.get('reasoning_content') or '').strip()
+        sys.stderr.write(f"INFO: reasoning_content size: {len(rc)} chars\n")
+        if rc:
+            m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', rc, re.IGNORECASE)
+            if m:
+                content = m.group(1).strip()
+                sys.stderr.write(f"INFO: HTML из reasoning: {len(content)} chars\n")
+            else:
+                sys.stderr.write(f"ERROR: DOCTYPE не найден в reasoning\nRC end: ...{rc[-500:]}\n")
+                sys.exit(1)
+
+    if not content:
+        sys.stderr.write("ERROR: content и reasoning пусты\n")
+        sys.exit(1)
+
+except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+    sys.stderr.write(f"JSON ERROR: {e}\n")
+    sys.exit(1)
+
+# Убираем markdown-обёртку
 content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
 content = re.sub(r'\n?```\s*$', '', content)
 content = content.strip()
 
-# Ищем <!DOCTYPE если перед ним мусор
+# Ищем DOCTYPE если есть мусор перед ним
 if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
     m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', content, re.IGNORECASE)
     if m:
@@ -228,11 +271,12 @@ if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', cont
     sys.stderr.write(f"NOT HTML. Start: {content[:300]}\n")
     sys.exit(1)
 
-if len(content) < MIN_SIZE:
-    sys.stderr.write(f"TOO SMALL: {len(content)} bytes\n{content[:200]}\n")
+size = len(content)
+if size < 3000:
+    sys.stderr.write(f"TOO SMALL: {size} bytes\n{content[:300]}\n")
     sys.exit(1)
 
-sys.stderr.write(f"OK: {len(content)} bytes\n")
+sys.stderr.write(f"OK: {size} bytes\n")
 print(content)
 PYEOF
 
@@ -249,50 +293,28 @@ PYEOF
     return 0
 }
 
+# ─── AI: перебор моделей ──────────────────────────────────────────────────────
+
 generate_ai_site() {
     local theme="$1"
     local output_file="$2"
 
-    local -a models=("openai" "openai-large" "gemini" "mistral")
+    # Единственная анонимная модель на text.pollinations.ai
+    local -a models=("openai-fast")
 
     for model in "${models[@]}"; do
-        echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...${YELLOW}                    ${NC}"
+        echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...                    "
         if _try_generate "$theme" "$output_file" "$model"; then
             log "Успех с моделью: $model"
             echo -e "\r  ${GREEN}[AI]${NC} Модель ${CYAN}${model}${NC} сработала ✓                    "
             return 0
         fi
-        log "Модель $model не дала результат, пробуем следующую..."
-        sleep 1
+        log "Модель $model не дала результат"
     done
 
     log "Все модели исчерпаны"
     return 1
 }
-
-
-generate_ai_site() {
-    local theme="$1"
-    local output_file="$2"
-
-    # Только модели которые реально работают в GET API pollinations
-    local -a models=("openai" "openai-large" "gemini" "searchgpt")
-
-    for model in "${models[@]}"; do
-        echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...${YELLOW}                    ${NC}"
-        if _try_generate "$theme" "$output_file" "$model"; then
-            log "Успех с моделью: $model"
-            echo -e "\r  ${GREEN}[AI]${NC} Модель ${CYAN}${model}${NC} сработала ✓${YELLOW}                    ${NC}"
-            return 0
-        fi
-        log "Модель $model не дала результат, пробуем следующую..."
-        sleep 1
-    done
-
-    log "Все модели исчерпаны"
-    return 1
-}
-
 
 # ─── AI: спиннер ──────────────────────────────────────────────────────────────
 
@@ -463,7 +485,7 @@ ${http2_directive}
     add_header X-Frame-Options DENY always;
     add_header X-Content-Type-Options nosniff always;
 
-    real_ip_header  proxy_protocol;
+    real_ip_header   proxy_protocol;
     set_real_ip_from 127.0.0.1;
 
     location / {
@@ -566,7 +588,7 @@ ok "Порты 80 и 443 свободны"
 
 # ── 10. AI генерация сайта ───────────────────────────────────────────────────
 step "Генерация сайта через AI (тема: \"$SITE_THEME\")..."
-echo -e "\n  ${CYAN}Запрос отправлен. AI думает — это может занять до 10 минут.${NC}"
+echo -e "\n  ${CYAN}Запрос отправлен. AI думает — это может занять до 5 минут.${NC}"
 
 AI_HTML_FILE=$(mktemp /tmp/ai_site_XXXXXX.html)
 FALLBACK_USED=false
@@ -586,10 +608,10 @@ if [[ $AI_EXIT -eq 0 ]] && [[ -s "$AI_HTML_FILE" ]]; then
     HTML_SIZE=$(wc -c < "$WEBROOT/index.html")
     ok "AI сайт сгенерирован и установлен (${HTML_SIZE} байт)"
 else
-    warn "Все AI модели не дали результат — используется страница-заглушка"
+    warn "AI не дал результат — используется страница-заглушка"
     echo -e "  ${YELLOW}Подробности в логе: $LOG_FILE${NC}"
     echo -e "  ${BLUE}Последние записи лога:${NC}"
-    grep -i "ai\|curl\|parse\|html\|raw\|error\|модел" "$LOG_FILE" 2>/dev/null \
+    grep -i "ai\|curl\|parse\|html\|raw\|error\|модел\|reasoning" "$LOG_FILE" 2>/dev/null \
         | tail -8 \
         | while read -r line; do
             echo -e "  ${YELLOW}→${NC} $line"
