@@ -17,7 +17,7 @@ GITHUB_URL="https://github.com/begugla0/selfsniscripts"
 LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
 NGINX_CONF_DIR="/etc/nginx/sites-enabled"
 WEBROOT="/var/www/html"
-AI_API_URL="https://gen.pollinations.ai/v1/chat/completions"
+AI_API_URL="https://text.pollinations.ai/openai"
 
 TOTAL_STEPS=14
 CURRENT_STEP=0
@@ -211,8 +211,6 @@ print(json.dumps({
     curl -s --max-time 300 \
         -X POST "$AI_API_URL" \
         -H "content-type: application/json" \
-        -H "origin: https://pollinations.ai" \
-        -H "referer: https://pollinations.ai/" \
         -d "@$payload_file" \
         -o "$response_file" \
         2>> "$LOG_FILE"
