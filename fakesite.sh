@@ -11,7 +11,7 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # ─── Константы ────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 SCRIPT_NAME="Self SNI Scripts"
 GITHUB_URL="https://github.com/begugla0/selfsniscripts"
 LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
@@ -90,27 +90,31 @@ detect_os() {
 }
 
 validate_domain() {
-    echo "$1" | grep -qE '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$' \
-        || die "Некорректный формат домена: $1"
+    local domain="$1"
+    local result
+    result=$(echo "$domain" | grep -cE '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$' || true)
+    if [[ "$result" -eq 0 ]]; then
+        die "Некорректный формат домена: $domain"
+    fi
 }
 
 validate_port() {
-    local port="$1"
+    local port="${1:-}"
     if [[ -z "$port" ]]; then
         die "Порт не может быть пустым"
     fi
     if ! [[ "$port" =~ ^[0-9]+$ ]]; then
         die "Порт должен быть числом: $port"
     fi
-    if ! (( port >= 1 && port <= 65535 )); then
+    local port_num
+    port_num=$(( port + 0 )) || die "Ошибка преобразования порта"
+    if [[ $port_num -lt 1 ]] || [[ $port_num -gt 65535 ]]; then
         die "Некорректный порт: $port (допустимо 1–65535)"
     fi
-    if (( port < 1024 )); then
+    if [[ $port_num -lt 1024 ]]; then
         warn "Порт $port < 1024 — привилегированный."
     fi
 }
-
-
 
 get_external_ip() {
     local ip=""
@@ -120,15 +124,19 @@ get_external_ip() {
         "https://icanhazip.com" \
         "https://checkip.amazonaws.com"
     do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]') || true
         [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
     done
     return 1
 }
 
 check_port_free() {
-    ss -tuln 2>/dev/null | grep -q ":${1} \|:${1}$" \
-        && die "Порт $1 занят. Освободите его перед установкой." "$GITHUB_URL"
+    local port="$1"
+    local result
+    result=$(ss -tuln 2>/dev/null | grep -c ":${port} \|:${port}$" || true)
+    if [[ "$result" -gt 0 ]]; then
+        die "Порт $port занят. Освободите его перед установкой." "$GITHUB_URL"
+    fi
 }
 
 # ─── AI: промт ────────────────────────────────────────────────────────────────
@@ -157,7 +165,7 @@ DESIGN REQUIREMENTS:
 EOF
 }
 
-# ─── AI: запрос и парсинг ────────────────────────────────────────────────────
+# ─── AI: запрос и парсинг ─────────────────────────────────────────────────────
 
 generate_ai_site() {
     local theme="$1"
@@ -175,7 +183,7 @@ payload = {
     'messages': [{'role': 'user', 'content': prompt}]
 }
 print(json.dumps(payload))
-" <<< "$prompt")
+" <<< "$prompt") || return 1
 
     log "AI запрос отправлен (тема: $theme)"
 
@@ -196,7 +204,7 @@ try:
     data = json.loads(raw)
     content = data['choices'][0]['message']['content']
 except Exception as e:
-    print('__PARSE_ERROR__: ' + str(e), file=sys.stderr)
+    print('PARSE_ERROR: ' + str(e), file=sys.stderr)
     sys.exit(1)
 
 content = re.sub(r'^\s*\`\`\`(?:html)?\s*', '', content, flags=re.IGNORECASE)
@@ -204,7 +212,7 @@ content = re.sub(r'\s*\`\`\`\s*$', '', content)
 content = content.strip()
 
 if not content.lower().startswith('<!doctype') and '<html' not in content.lower():
-    print('__NOT_HTML__', file=sys.stderr)
+    print('NOT_HTML', file=sys.stderr)
     sys.exit(1)
 
 print(content)
@@ -214,7 +222,7 @@ print(content)
     return 0
 }
 
-# ─── AI: спиннер с анимацией ─────────────────────────────────────────────────
+# ─── AI: спиннер ──────────────────────────────────────────────────────────────
 
 spinner() {
     local pid=$1
@@ -238,8 +246,6 @@ spinner() {
     local phase_label=""
 
     start_time=$(date +%s)
-
-    # Резервируем 2 строки
     printf "\n\n"
 
     while kill -0 "$pid" 2>/dev/null; do
@@ -247,7 +253,6 @@ spinner() {
         minutes=$(( elapsed / 60 ))
         seconds=$(( elapsed % 60 ))
 
-        # Текущая фаза
         for phase in "${phases[@]}"; do
             local p_start p_end p_label
             p_start="${phase%%:*}"
@@ -259,7 +264,6 @@ spinner() {
             fi
         done
 
-        # Прогресс-бар (600 сек = 100%)
         local max_sec=600
         local pct=$(( elapsed * 100 / max_sec ))
         (( pct > 99 )) && pct=99
@@ -271,13 +275,11 @@ spinner() {
         for (( i=0; i<filled; i++ )); do bar_str+="█"; done
         for (( i=0; i<empty;  i++ )); do bar_str+="░"; done
 
-        # Мигающая точка
         local dot
         (( (frame_i / 5) % 2 == 0 )) \
             && dot="${MAGENTA}●${NC}" \
             || dot="${BLUE}○${NC}"
 
-        # Время и ETA
         local time_str eta_str
         printf -v time_str "%02d:%02d" "$minutes" "$seconds"
         if (( elapsed > 5 && elapsed < max_sec )); then
@@ -289,23 +291,18 @@ spinner() {
             eta_str="оцениваю время..."
         fi
 
-        # Рендер: поднимаемся на 2 строки и перерисовываем
         printf "\033[2A"
         printf "\r  %b %s  ${CYAN}%s${NC}%60s\n" \
             "$dot" \
             "${frames:$((frame_i % ${#frames})):1}" \
             "$phase_label" ""
         printf "\r  ${CYAN}[${GREEN}%s${YELLOW}%s${CYAN}]${NC}  ${YELLOW}%s${NC}  ${BLUE}%s${NC}%30s\n" \
-            "$bar_str" \
-            "" \
-            "$time_str" \
-            "$eta_str" ""
+            "$bar_str" "" "$time_str" "$eta_str" ""
 
         frame_i=$(( frame_i + 1 ))
         sleep 0.1
     done
 
-    # Очищаем строки спиннера
     printf "\033[2A"
     printf "\r%80s\n\r%80s\n" "" ""
     printf "\033[2A"
@@ -421,21 +418,34 @@ detect_os
 step "Ожидание ввода данных..."
 echo ""
 
+# Отключаем set -e на время интерактивного ввода
+set +e
+
 read -rp "  Введите доменное имя:                           " DOMAIN
+read -rp "  Email для Let's Encrypt (Enter = admin@$DOMAIN): " LE_EMAIL
+read -rp "  Внутренний SNI порт        (Enter = 9000):       " SPORT
+echo ""
+echo -e "  ${CYAN}Тематика определяет что AI сгенерирует для сайта.${NC}"
+echo -e "  ${YELLOW}Примеры:${NC} ремонт квартир, юридические услуги, кофейня,"
+echo -e "           IT-компания, фитнес-клуб, медицинская клиника"
+echo ""
+read -rp "  Тематика сайта             (Enter = IT-компания): " SITE_THEME
+
+# Подставляем дефолты
+LE_EMAIL="${LE_EMAIL:-"admin@$DOMAIN"}"
+SPORT="${SPORT:-9000}"
+SITE_THEME="${SITE_THEME:-IT-компания}"
+
+# Возвращаем set -e
+set -e
+
+# Теперь валидируем
 [[ -z "$DOMAIN" ]] && die "Доменное имя не может быть пустым"
 validate_domain "$DOMAIN"
 validate_port "$SPORT"
 
-read -rp "  Email для Let's Encrypt (Enter = admin@$DOMAIN): " LE_EMAIL
-LE_EMAIL="${LE_EMAIL:-"admin@$DOMAIN"}"
-
-read -rp "  Внутренний SNI порт        (Enter = 9000):       " SPORT
-SPORT="${SPORT:-9000}"
-
-read -rp "  Тематика сайта             (Enter = IT-компания): " SITE_THEME
-SITE_THEME="${SITE_THEME:-IT-компания}"
-
 ok "Параметры: домен=$DOMAIN  порт=$SPORT  тема=\"$SITE_THEME\""
+log "Параметры: DOMAIN=$DOMAIN LE_EMAIL=$LE_EMAIL SPORT=$SPORT SITE_THEME=$SITE_THEME"
 
 # ── 3. Обновление пакетов ────────────────────────────────────────────────────
 step "Обновление списка пакетов..."
@@ -457,7 +467,7 @@ ok "Внешний IP: $EXTERNAL_IP"
 
 # ── 6. DNS A-запись ──────────────────────────────────────────────────────────
 step "Проверка A-записи $DOMAIN..."
-DOMAIN_IP=$(dig +short A "$DOMAIN" @1.1.1.1 | grep -E '^[0-9.]+$' | head -n1)
+DOMAIN_IP=$(dig +short A "$DOMAIN" @1.1.1.1 | grep -E '^[0-9.]+$' | head -n1 || true)
 [[ -z "$DOMAIN_IP" ]] && die "A-запись для $DOMAIN не найдена" "$GITHUB_URL"
 ok "DNS A-запись: $DOMAIN_IP"
 
@@ -485,12 +495,15 @@ echo -e "\n  ${CYAN}Запрос отправлен. AI думает — это 
 AI_HTML_FILE=$(mktemp /tmp/ai_site_XXXXXX.html)
 FALLBACK_USED=false
 
+set +e
 generate_ai_site "$SITE_THEME" "$AI_HTML_FILE" &
 AI_PID=$!
 spinner "$AI_PID"
-wait "$AI_PID" && AI_OK=true || AI_OK=false
+wait "$AI_PID"
+AI_EXIT=$?
+set -e
 
-if $AI_OK && [[ -s "$AI_HTML_FILE" ]]; then
+if [[ $AI_EXIT -eq 0 ]] && [[ -s "$AI_HTML_FILE" ]]; then
     rm -rf "${WEBROOT:?}"/*
     cp "$AI_HTML_FILE" "$WEBROOT/index.html"
     chmod 644 "$WEBROOT/index.html"
@@ -564,7 +577,11 @@ ok "Nginx запущен и добавлен в автозагрузку"
 # ── 14. Финальная проверка ───────────────────────────────────────────────────
 step "Финальная проверка сервера..."
 sleep 1
-if curl -sk --max-time 5 "https://127.0.0.1:$SPORT" -H "Host: $DOMAIN" -o /dev/null; then
+set +e
+curl -sk --max-time 5 "https://127.0.0.1:$SPORT" -H "Host: $DOMAIN" -o /dev/null
+CURL_EXIT=$?
+set -e
+if [[ $CURL_EXIT -eq 0 ]]; then
     ok "Сервер отвечает на 127.0.0.1:$SPORT"
 else
     warn "Сервер не ответил на тестовый запрос (возможно, нужен proxy_protocol)"
