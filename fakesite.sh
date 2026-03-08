@@ -195,7 +195,8 @@ print(json.dumps({
     'messages': [{'role': 'user', 'content': prompt}],
     'stream': False,
     'seed': $rand_seed,
-    'max_tokens': 16000
+    'max_tokens': 32000,
+    'reasoning': {'effort': 'low'}
 }))
 " <<< "$prompt" > "$payload_file"
     local py_exit=$?
@@ -226,6 +227,15 @@ print(json.dumps({
     fi
 
     log "[$model] RAW (first 300): $(head -c 300 "$response_file")"
+
+    # Проверка на 502/nginx ошибку до парсинга JSON
+    local first_bytes
+    first_bytes=$(head -c 15 "$response_file" 2>/dev/null || true)
+    if [[ "$first_bytes" != *"{"* ]]; then
+        log "[$model] Ответ не JSON (502/nginx error): $first_bytes"
+        rm -f "$response_file" "$parse_script"
+        return 1
+    fi
 
     cat > "$parse_script" << 'PYEOF'
 import sys, json, re
@@ -281,7 +291,7 @@ if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', cont
     sys.exit(1)
 
 size = len(content)
-if size < 3000:
+if size < 500:
     sys.stderr.write(f"TOO SMALL: {size} bytes\n")
     sys.exit(1)
 
