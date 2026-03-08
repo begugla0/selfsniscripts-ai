@@ -179,14 +179,18 @@ _try_generate() {
     response_file=$(mktemp /tmp/ai_response_XXXXXX.json)
     parse_script=$(mktemp /tmp/ai_parser_XXXXXX.py)
 
-    # Строим payload
+    # Рандомный seed ломает кеш pollinations
+    local rand_seed
+    rand_seed=$(( RANDOM * RANDOM ))
+
     python3 -c "
 import json, sys
 prompt = sys.stdin.read()
 print(json.dumps({
     'model': '$model',
     'messages': [{'role': 'user', 'content': prompt}],
-    'stream': False
+    'stream': False,
+    'seed': $rand_seed
 }))
 " <<< "$prompt" > "$payload_file" || {
         log "[$model] PAYLOAD BUILD FAILED"
@@ -194,9 +198,8 @@ print(json.dumps({
         return 1
     }
 
-    log "[$model] Отправляем запрос..."
+    log "[$model] Отправляем запрос (seed=$rand_seed)..."
 
-    # Ответ сохраняем в файл — без обрезки bash-переменными
     curl -s --max-time 120 \
         -X POST "$AI_API_URL" \
         -H "content-type: application/json" \
@@ -216,9 +219,10 @@ print(json.dumps({
         return 1
     fi
 
-    # Пишем парсер в файл — избегаем конфликта heredoc vs stdin
     cat > "$parse_script" << 'PYEOF'
 import sys, json, re
+
+MIN_HTML_SIZE = 5000  # минимум 5кб — иначе это обрезок
 
 with open(sys.argv[1], 'r', encoding='utf-8', errors='replace') as f:
     raw = f.read()
@@ -234,6 +238,7 @@ try:
 
     msg = data['choices'][0]['message']
     content = (msg.get('content') or '').strip()
+    content_source = 'content'
 
     if not content:
         rc = (msg.get('reasoning_content') or '').strip()
@@ -242,37 +247,44 @@ try:
             m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', rc, re.IGNORECASE)
             if m:
                 content = m.group(1).strip()
-                sys.stderr.write(f"INFO: HTML найден в reasoning ({len(content)} chars)\n")
+                content_source = 'reasoning_content'
+                sys.stderr.write(f"INFO: HTML из reasoning ({len(content)} chars)\n")
             else:
                 sys.stderr.write(f"ERROR: HTML не найден в reasoning\nRC[:400]:\n{rc[:400]}\n")
                 sys.exit(1)
 
     if not content:
-        sys.stderr.write("ERROR: content и reasoning_content пусты\n")
+        sys.stderr.write("ERROR: content и reasoning пусты\n")
         sys.exit(1)
 
 except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
     sys.stderr.write(f"JSON ERROR: {e}\nRAW[:300]: {raw[:300]}\n")
     sys.exit(1)
 
-# Убираем markdown-обёртку
+# Убираем markdown
 content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
 content = re.sub(r'\n?```\s*$', '', content)
 content = content.strip()
 
-# Ищем HTML если он в середине текста
+# Ищем HTML если в середине текста
 if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
     m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', content, re.IGNORECASE)
     if m:
         content = m.group(1).strip()
-        sys.stderr.write("INFO: HTML извлечён из середины текста\n")
 
-if content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE):
-    print(content)
-    sys.exit(0)
+if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
+    sys.stderr.write(f"NOT HTML. Start: {content[:300]}\n")
+    sys.exit(1)
 
-sys.stderr.write(f"NOT HTML. Start: {content[:300]}\n")
-sys.exit(1)
+# Проверка минимального размера
+if len(content) < MIN_HTML_SIZE:
+    sys.stderr.write(f"TOO SMALL: {len(content)} bytes (source={content_source}, min={MIN_HTML_SIZE})\n")
+    sys.stderr.write(f"CONTENT: {content[:500]}\n")
+    sys.exit(1)
+
+sys.stderr.write(f"OK: HTML {len(content)} bytes from {content_source}\n")
+print(content)
+sys.exit(0)
 PYEOF
 
     local html
@@ -285,7 +297,7 @@ PYEOF
     rm -f "$response_file" "$parse_script"
 
     if [[ -z "$html" ]]; then
-        log "[$model] HTML пустой после парсинга"
+        log "[$model] HTML пустой"
         return 1
     fi
 
@@ -293,6 +305,7 @@ PYEOF
     log "[$model] HTML записан: $(wc -c < "$output_file") байт"
     return 0
 }
+
 
 # ─── AI: перебор моделей ──────────────────────────────────────────────────────
 
