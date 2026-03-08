@@ -11,12 +11,13 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # ─── Константы ────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="2.7.0"
+SCRIPT_VERSION="2.8.0"
 SCRIPT_NAME="Self SNI Scripts"
 GITHUB_URL="https://github.com/begugla0/selfsniscripts"
 LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
 NGINX_CONF_DIR="/etc/nginx/sites-enabled"
 WEBROOT="/var/www/html"
+AI_API_URL="https://gen.pollinations.ai/v1/chat/completions"
 
 TOTAL_STEPS=14
 CURRENT_STEP=0
@@ -170,8 +171,14 @@ _try_generate() {
     local output_file="$2"
     local model="$3"
 
+    log "[$model] _try_generate START"
+
     local prompt
-    prompt=$(build_ai_prompt "$theme")
+    prompt=$(build_ai_prompt "$theme") || {
+        log "[$model] build_ai_prompt FAILED"
+        return 1
+    }
+    log "[$model] prompt length: ${#prompt}"
 
     local payload_file response_file parse_script
     payload_file=$(mktemp /tmp/ai_payload_XXXXXX.json)
@@ -190,36 +197,37 @@ print(json.dumps({
     'seed': $rand_seed,
     'max_tokens': 16000
 }))
-" <<< "$prompt" > "$payload_file" || {
-        log "[$model] PAYLOAD BUILD FAILED"
+" <<< "$prompt" > "$payload_file"
+    local py_exit=$?
+    log "[$model] payload python exit=$py_exit size=$(wc -c < "$payload_file")"
+
+    if [[ $py_exit -ne 0 ]]; then
+        log "[$model] PAYLOAD FAILED"
         rm -f "$payload_file" "$response_file" "$parse_script"
         return 1
-    }
+    fi
 
-    log "[$model] POST запрос к gen.pollinations.ai (seed=$rand_seed)..."
-
+    log "[$model] curl start..."
     curl -s --max-time 300 \
         -X POST "$AI_API_URL" \
         -H "content-type: application/json" \
-        -H "authorization: Bearer $AI_API_KEY" \
         -H "origin: https://pollinations.ai" \
         -H "referer: https://pollinations.ai/" \
         -d "@$payload_file" \
-        -o "$response_file" || {
-        log "[$model] CURL FAILED"
-        rm -f "$payload_file" "$response_file" "$parse_script"
-        return 1
-    }
+        -o "$response_file" \
+        2>> "$LOG_FILE"
+    local curl_exit=$?
+    log "[$model] curl exit=$curl_exit response_size=$(wc -c < "$response_file" 2>/dev/null || echo 0)"
 
     rm -f "$payload_file"
-    log "[$model] RAW size: $(wc -c < "$response_file") bytes"
-    log "[$model] RAW (first 300): $(head -c 300 "$response_file")"
 
-    if [[ ! -s "$response_file" ]]; then
-        log "[$model] Пустой ответ"
+    if [[ $curl_exit -ne 0 ]] || [[ ! -s "$response_file" ]]; then
+        log "[$model] CURL FAILED or empty response"
         rm -f "$response_file" "$parse_script"
         return 1
     fi
+
+    log "[$model] RAW (first 300): $(head -c 300 "$response_file")"
 
     cat > "$parse_script" << 'PYEOF'
 import sys, json, re
@@ -239,7 +247,6 @@ try:
     msg = data['choices'][0]['message']
     content = (msg.get('content') or '').strip()
 
-    # Фолбэк на reasoning_content если content пуст
     if not content:
         rc = (msg.get('reasoning_content') or '').strip()
         sys.stderr.write(f"INFO: content пуст, reasoning size: {len(rc)}\n")
@@ -248,7 +255,7 @@ try:
             if m:
                 content = m.group(1).strip()
             else:
-                sys.stderr.write(f"ERROR: HTML не найден\nRC end: {rc[-300:]}\n")
+                sys.stderr.write(f"ERROR: HTML не найден в reasoning\nRC end: {rc[-300:]}\n")
                 sys.exit(1)
 
     if not content:
@@ -262,12 +269,10 @@ except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
     sys.stderr.write(f"JSON ERROR: {e}\nRAW[:200]: {raw[:200]}\n")
     sys.exit(1)
 
-# Убираем markdown
 content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
 content = re.sub(r'\n?```\s*$', '', content)
 content = content.strip()
 
-# Ищем DOCTYPE если есть мусор
 if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
     m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', content, re.IGNORECASE)
     if m:
@@ -287,17 +292,25 @@ print(content)
 PYEOF
 
     local html
-    html=$(python3 "$parse_script" "$response_file") || {
+    html=$(python3 "$parse_script" "$response_file" 2>> "$LOG_FILE") || {
         rm -f "$response_file" "$parse_script"
         log "[$model] PARSE FAILED"
         return 1
     }
 
     rm -f "$response_file" "$parse_script"
+
+    if [[ -z "$html" ]]; then
+        log "[$model] HTML пустой после парсинга"
+        return 1
+    fi
+
     echo "$html" > "$output_file"
     log "[$model] HTML записан: $(wc -c < "$output_file") байт"
     return 0
 }
+
+# ─── AI: перебор моделей ──────────────────────────────────────────────────────
 
 generate_ai_site() {
     local theme="$1"
@@ -511,7 +524,7 @@ log "=== $SCRIPT_NAME v$SCRIPT_VERSION started ==="
 
 clear
 echo -e "${CYAN}╔═════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   $SCRIPT_NAME v$SCRIPT_VERSION by begugla          ║${NC}"
+echo -e "${CYAN}║   $SCRIPT_NAME v$SCRIPT_VERSION by begugla         ║${NC}"
 echo -e "${CYAN}╚═════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -615,8 +628,8 @@ else
     warn "AI не дал результат — используется страница-заглушка"
     echo -e "  ${YELLOW}Подробности в логе: $LOG_FILE${NC}"
     echo -e "  ${BLUE}Последние записи лога:${NC}"
-    grep -i "ai\|curl\|parse\|html\|raw\|error\|модел\|reasoning" "$LOG_FILE" 2>/dev/null \
-        | tail -8 \
+    grep -i "ai\|curl\|parse\|html\|raw\|error\|модел\|reasoning\|exit" "$LOG_FILE" 2>/dev/null \
+        | tail -10 \
         | while read -r line; do
             echo -e "  ${YELLOW}→${NC} $line"
           done
