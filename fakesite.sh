@@ -11,14 +11,14 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # ─── Константы ────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.4.0"
 SCRIPT_NAME="Self SNI Scripts"
 GITHUB_URL="https://github.com/begugla0/selfsniscripts"
 LOG_FILE="/var/log/sni_setup_$(date +%Y%m%d_%H%M%S).log"
 NGINX_CONF_DIR="/etc/nginx/sites-enabled"
 WEBROOT="/var/www/html"
 AI_API_URL="https://text.pollinations.ai/openai"
-AI_MODEL="openai-fast"
+AI_MODEL="openai"
 
 TOTAL_STEPS=14
 CURRENT_STEP=0
@@ -180,12 +180,13 @@ import json, sys
 prompt = sys.stdin.read()
 payload = {
     'model': '${AI_MODEL}',
-    'messages': [{'role': 'user', 'content': prompt}]
+    'messages': [{'role': 'user', 'content': prompt}],
+    'stream': False
 }
 print(json.dumps(payload))
 " <<< "$prompt") || { log "PAYLOAD BUILD FAILED"; return 1; }
 
-    log "AI запрос отправлен (тема: $theme)"
+    log "AI запрос отправлен (тема: $theme, модель: ${AI_MODEL})"
 
     local response
     response=$(curl -s --max-time 600 \
@@ -193,7 +194,6 @@ print(json.dumps(payload))
         -H "content-type: application/json" \
         -d "$payload") || { log "CURL FAILED (exit $?)"; return 1; }
 
-    # Логируем сырой ответ для диагностики
     log "AI RAW RESPONSE (first 500): ${response:0:500}"
 
     if [[ -z "$response" ]]; then
@@ -209,16 +209,36 @@ raw = sys.stdin.read()
 
 try:
     data = json.loads(raw)
-    content = data['choices'][0]['message']['content']
+    msg = data['choices'][0]['message']
+
+    # Сначала пробуем content
+    content = (msg.get('content') or '').strip()
+
+    # Думающие модели могут класть ответ в reasoning_content
+    if not content:
+        content = (msg.get('reasoning_content') or '').strip()
+        if content:
+            sys.stderr.write("INFO: использован reasoning_content\n")
+
+    if not content:
+        sys.stderr.write(f"ERROR: content и reasoning_content пусты\nFULL MSG: {json.dumps(msg)[:500]}\n")
+        sys.exit(1)
+
 except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
     sys.stderr.write(f"JSON PARSE ERROR: {e}\nRAW START: {raw[:300]}\n")
-    # Пробуем использовать raw напрямую если это уже HTML
     content = raw.strip()
 
-# Убираем markdown-обёртку если модель всё же добавила
+# Убираем markdown-обёртку
 content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
 content = re.sub(r'\n?```\s*$', '', content)
 content = content.strip()
+
+# Ищем HTML если он внутри текста
+if not (content.lower().startswith('<!doctype') or '<html' in content.lower()):
+    html_match = re.search(r'(<!DOCTYPE\s+html.*)', content, re.IGNORECASE | re.DOTALL)
+    if html_match:
+        content = html_match.group(1).strip()
+        sys.stderr.write("INFO: HTML извлечён из середины текста\n")
 
 if content.lower().startswith('<!doctype') or '<html' in content.lower():
     print(content)
@@ -360,6 +380,26 @@ EOF
 
 write_nginx_config() {
     local domain=$1 sport=$2 conf_path=$3
+
+    # Определяем синтаксис http2 по версии nginx
+    local nginx_ver major minor
+    nginx_ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    major=$(echo "$nginx_ver" | cut -d. -f1)
+    minor=$(echo "$nginx_ver" | cut -d. -f2)
+
+    local http2_listen http2_directive
+    if (( major > 1 || ( major == 1 && minor >= 25 ) )); then
+        # nginx >= 1.25.1 — новый синтаксис
+        http2_listen="ssl"
+        http2_directive="    http2 on;"
+    else
+        # nginx < 1.25.1 — старый синтаксис
+        http2_listen="ssl http2"
+        http2_directive=""
+    fi
+
+    log "Nginx $nginx_ver: http2_listen='$http2_listen'"
+
     cat > "$conf_path" <<EOF
 # Сгенерировано $SCRIPT_NAME v$SCRIPT_VERSION — $(date)
 server {
@@ -376,9 +416,8 @@ server {
 }
 
 server {
-    listen 127.0.0.1:${sport} ssl;
-    http2 on;
-
+    listen 127.0.0.1:${sport} ${http2_listen};
+${http2_directive}
     server_name $domain;
 
     ssl_certificate         /etc/letsencrypt/live/$domain/fullchain.pem;
@@ -527,9 +566,11 @@ else
     warn "AI вернул некорректный ответ — используется страница-заглушка"
     echo -e "  ${YELLOW}Подробности в логе: $LOG_FILE${NC}"
     echo -e "  ${BLUE}Последние записи лога:${NC}"
-    grep -i "ai\|curl\|parse\|html\|raw\|error" "$LOG_FILE" 2>/dev/null | tail -5 | while read -r line; do
-        echo -e "  ${YELLOW}→${NC} $line"
-    done
+    grep -i "ai\|curl\|parse\|html\|raw\|error" "$LOG_FILE" 2>/dev/null \
+        | tail -5 \
+        | while read -r line; do
+            echo -e "  ${YELLOW}→${NC} $line"
+          done
     FALLBACK_USED=true
     cat > "$WEBROOT/index.html" <<'FALLBACK'
 <!DOCTYPE html>
