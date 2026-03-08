@@ -188,7 +188,7 @@ print(urllib.parse.quote(sys.stdin.read(), safe=''))
     local rand_seed=$(( RANDOM * RANDOM ))
     log "[$model] GET запрос (seed=$rand_seed)..."
 
-    # GET API возвращает plain text — никакого JSON, никакого reasoning_content
+    # GET API — plain text, никакого JSON и reasoning_content
     curl -s --max-time 180 \
         "https://text.pollinations.ai/${encoded_prompt}?model=${model}&seed=${rand_seed}" \
         -o "$response_file" || {
@@ -213,29 +213,27 @@ MIN_SIZE = 10000
 with open(sys.argv[1], 'r', encoding='utf-8', errors='replace') as f:
     content = f.read().strip()
 
-# Убираем markdown-обёртку если модель добавила
+# Убираем markdown
 content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
 content = re.sub(r'\n?```\s*$', '', content)
 content = content.strip()
 
-# Ищем начало HTML если перед ним есть мусор
+# Ищем <!DOCTYPE если перед ним мусор
 if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
     m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', content, re.IGNORECASE)
     if m:
         content = m.group(1).strip()
-        sys.stderr.write(f"INFO: HTML извлечён из середины\n")
 
 if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
     sys.stderr.write(f"NOT HTML. Start: {content[:300]}\n")
     sys.exit(1)
 
 if len(content) < MIN_SIZE:
-    sys.stderr.write(f"TOO SMALL: {len(content)} bytes (min={MIN_SIZE})\nContent: {content[:300]}\n")
+    sys.stderr.write(f"TOO SMALL: {len(content)} bytes\n{content[:200]}\n")
     sys.exit(1)
 
 sys.stderr.write(f"OK: {len(content)} bytes\n")
 print(content)
-sys.exit(0)
 PYEOF
 
     local html
@@ -246,16 +244,32 @@ PYEOF
     }
 
     rm -f "$response_file" "$parse_script"
-
-    if [[ -z "$html" ]]; then
-        log "[$model] HTML пустой"
-        return 1
-    fi
-
     echo "$html" > "$output_file"
     log "[$model] HTML записан: $(wc -c < "$output_file") байт"
     return 0
 }
+
+generate_ai_site() {
+    local theme="$1"
+    local output_file="$2"
+
+    local -a models=("openai" "openai-large" "gemini" "mistral")
+
+    for model in "${models[@]}"; do
+        echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...${YELLOW}                    ${NC}"
+        if _try_generate "$theme" "$output_file" "$model"; then
+            log "Успех с моделью: $model"
+            echo -e "\r  ${GREEN}[AI]${NC} Модель ${CYAN}${model}${NC} сработала ✓                    "
+            return 0
+        fi
+        log "Модель $model не дала результат, пробуем следующую..."
+        sleep 1
+    done
+
+    log "Все модели исчерпаны"
+    return 1
+}
+
 
 generate_ai_site() {
     local theme="$1"
