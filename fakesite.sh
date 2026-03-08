@@ -174,44 +174,30 @@ _try_generate() {
     local prompt
     prompt=$(build_ai_prompt "$theme")
 
-    local payload_file response_file parse_script
-    payload_file=$(mktemp /tmp/ai_payload_XXXXXX.json)
-    response_file=$(mktemp /tmp/ai_response_XXXXXX.json)
+    local response_file parse_script
+    response_file=$(mktemp /tmp/ai_response_XXXXXX.html)
     parse_script=$(mktemp /tmp/ai_parser_XXXXXX.py)
 
-    # Рандомный seed ломает кеш pollinations
-    local rand_seed
-    rand_seed=$(( RANDOM * RANDOM ))
+    # Кодируем промт для URL
+    local encoded_prompt
+    encoded_prompt=$(python3 -c "
+import urllib.parse, sys
+print(urllib.parse.quote(sys.stdin.read(), safe=''))
+" <<< "$prompt")
 
-    python3 -c "
-import json, sys
-prompt = sys.stdin.read()
-print(json.dumps({
-    'model': '$model',
-    'messages': [{'role': 'user', 'content': prompt}],
-    'stream': False,
-    'seed': $rand_seed
-}))
-" <<< "$prompt" > "$payload_file" || {
-        log "[$model] PAYLOAD BUILD FAILED"
-        rm -f "$payload_file" "$response_file" "$parse_script"
-        return 1
-    }
+    local rand_seed=$(( RANDOM * RANDOM ))
+    log "[$model] GET запрос (seed=$rand_seed)..."
 
-    log "[$model] Отправляем запрос (seed=$rand_seed)..."
-
-    curl -s --max-time 120 \
-        -X POST "$AI_API_URL" \
-        -H "content-type: application/json" \
-        -d "@$payload_file" \
+    # GET API возвращает plain text — никакого JSON, никакого reasoning_content
+    curl -s --max-time 180 \
+        "https://text.pollinations.ai/${encoded_prompt}?model=${model}&seed=${rand_seed}" \
         -o "$response_file" || {
         log "[$model] CURL FAILED"
-        rm -f "$payload_file" "$response_file" "$parse_script"
+        rm -f "$response_file" "$parse_script"
         return 1
     }
 
-    rm -f "$payload_file"
-    log "[$model] RAW (first 400): $(head -c 400 "$response_file")"
+    log "[$model] RAW (first 300): $(head -c 300 "$response_file")"
 
     if [[ ! -s "$response_file" ]]; then
         log "[$model] Пустой ответ"
@@ -220,69 +206,34 @@ print(json.dumps({
     fi
 
     cat > "$parse_script" << 'PYEOF'
-import sys, json, re
+import sys, re
 
-MIN_HTML_SIZE = 5000  # минимум 5кб — иначе это обрезок
+MIN_SIZE = 10000
 
 with open(sys.argv[1], 'r', encoding='utf-8', errors='replace') as f:
-    raw = f.read()
+    content = f.read().strip()
 
-content = ''
-
-try:
-    data = json.loads(raw)
-
-    if 'error' in data:
-        sys.stderr.write(f"API ERROR: {data.get('error', '')}\n")
-        sys.exit(1)
-
-    msg = data['choices'][0]['message']
-    content = (msg.get('content') or '').strip()
-    content_source = 'content'
-
-    if not content:
-        rc = (msg.get('reasoning_content') or '').strip()
-        if rc:
-            sys.stderr.write(f"INFO: content пуст, ищем HTML в reasoning ({len(rc)} chars)\n")
-            m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', rc, re.IGNORECASE)
-            if m:
-                content = m.group(1).strip()
-                content_source = 'reasoning_content'
-                sys.stderr.write(f"INFO: HTML из reasoning ({len(content)} chars)\n")
-            else:
-                sys.stderr.write(f"ERROR: HTML не найден в reasoning\nRC[:400]:\n{rc[:400]}\n")
-                sys.exit(1)
-
-    if not content:
-        sys.stderr.write("ERROR: content и reasoning пусты\n")
-        sys.exit(1)
-
-except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
-    sys.stderr.write(f"JSON ERROR: {e}\nRAW[:300]: {raw[:300]}\n")
-    sys.exit(1)
-
-# Убираем markdown
+# Убираем markdown-обёртку если модель добавила
 content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
 content = re.sub(r'\n?```\s*$', '', content)
 content = content.strip()
 
-# Ищем HTML если в середине текста
+# Ищем начало HTML если перед ним есть мусор
 if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
     m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', content, re.IGNORECASE)
     if m:
         content = m.group(1).strip()
+        sys.stderr.write(f"INFO: HTML извлечён из середины\n")
 
 if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
     sys.stderr.write(f"NOT HTML. Start: {content[:300]}\n")
     sys.exit(1)
 
-# Проверка минимального размера
-if len(content) < MIN_HTML_SIZE:
-    sys.stderr.write(f"TOO SMALL: {len(content)} bytes (source={content_source}, min={MIN_HTML_SIZE})\n")
-    sys.stderr.write(f"CONTENT: {content[:500]}\n")
+if len(content) < MIN_SIZE:
+    sys.stderr.write(f"TOO SMALL: {len(content)} bytes (min={MIN_SIZE})\nContent: {content[:300]}\n")
     sys.exit(1)
 
-sys.stderr.write(f"OK: HTML {len(content)} bytes from {content_source}\n")
+sys.stderr.write(f"OK: {len(content)} bytes\n")
 print(content)
 sys.exit(0)
 PYEOF
@@ -306,14 +257,12 @@ PYEOF
     return 0
 }
 
-
-# ─── AI: перебор моделей ──────────────────────────────────────────────────────
-
 generate_ai_site() {
     local theme="$1"
     local output_file="$2"
 
-    local -a models=("openai-fast" "openai" "searchgpt")
+    # Только модели которые реально работают в GET API pollinations
+    local -a models=("openai" "openai-large" "gemini" "searchgpt")
 
     for model in "${models[@]}"; do
         echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...${YELLOW}                    ${NC}"
@@ -329,6 +278,7 @@ generate_ai_site() {
     log "Все модели исчерпаны"
     return 1
 }
+
 
 # ─── AI: спиннер ──────────────────────────────────────────────────────────────
 
