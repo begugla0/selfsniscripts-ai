@@ -196,11 +196,14 @@ print(json.dumps({
         return 1
     }
 
-    log "[$model] POST запрос (seed=$rand_seed, max_tokens=16000)..."
+    log "[$model] POST запрос к gen.pollinations.ai (seed=$rand_seed)..."
 
     curl -s --max-time 300 \
-        -X POST "https://text.pollinations.ai/openai" \
+        -X POST "$AI_API_URL" \
         -H "content-type: application/json" \
+        -H "authorization: Bearer $AI_API_KEY" \
+        -H "origin: https://pollinations.ai" \
+        -H "referer: https://pollinations.ai/" \
         -d "@$payload_file" \
         -o "$response_file" || {
         log "[$model] CURL FAILED"
@@ -210,7 +213,7 @@ print(json.dumps({
 
     rm -f "$payload_file"
     log "[$model] RAW size: $(wc -c < "$response_file") bytes"
-    log "[$model] RAW (first 400): $(head -c 400 "$response_file")"
+    log "[$model] RAW (first 300): $(head -c 300 "$response_file")"
 
     if [[ ! -s "$response_file" ]]; then
         log "[$model] Пустой ответ"
@@ -236,44 +239,47 @@ try:
     msg = data['choices'][0]['message']
     content = (msg.get('content') or '').strip()
 
+    # Фолбэк на reasoning_content если content пуст
     if not content:
         rc = (msg.get('reasoning_content') or '').strip()
-        sys.stderr.write(f"INFO: reasoning_content size: {len(rc)} chars\n")
+        sys.stderr.write(f"INFO: content пуст, reasoning size: {len(rc)}\n")
         if rc:
             m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', rc, re.IGNORECASE)
             if m:
                 content = m.group(1).strip()
-                sys.stderr.write(f"INFO: HTML из reasoning: {len(content)} chars\n")
             else:
-                sys.stderr.write(f"ERROR: DOCTYPE не найден в reasoning\nRC end: ...{rc[-500:]}\n")
+                sys.stderr.write(f"ERROR: HTML не найден\nRC end: {rc[-300:]}\n")
                 sys.exit(1)
 
     if not content:
         sys.stderr.write("ERROR: content и reasoning пусты\n")
         sys.exit(1)
 
+    tokens = data.get('usage', {}).get('completion_tokens', '?')
+    sys.stderr.write(f"INFO: completion_tokens={tokens}\n")
+
 except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
-    sys.stderr.write(f"JSON ERROR: {e}\n")
+    sys.stderr.write(f"JSON ERROR: {e}\nRAW[:200]: {raw[:200]}\n")
     sys.exit(1)
 
-# Убираем markdown-обёртку
+# Убираем markdown
 content = re.sub(r'^\s*```(?:html)?\s*\n?', '', content, flags=re.IGNORECASE)
 content = re.sub(r'\n?```\s*$', '', content)
 content = content.strip()
 
-# Ищем DOCTYPE если есть мусор перед ним
+# Ищем DOCTYPE если есть мусор
 if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
     m = re.search(r'(<!DOCTYPE\s+html[\s\S]*)', content, re.IGNORECASE)
     if m:
         content = m.group(1).strip()
 
 if not (content.lower().startswith('<!doctype') or re.search(r'<html[\s>]', content, re.IGNORECASE)):
-    sys.stderr.write(f"NOT HTML. Start: {content[:300]}\n")
+    sys.stderr.write(f"NOT HTML: {content[:200]}\n")
     sys.exit(1)
 
 size = len(content)
 if size < 3000:
-    sys.stderr.write(f"TOO SMALL: {size} bytes\n{content[:300]}\n")
+    sys.stderr.write(f"TOO SMALL: {size} bytes\n")
     sys.exit(1)
 
 sys.stderr.write(f"OK: {size} bytes\n")
@@ -293,14 +299,11 @@ PYEOF
     return 0
 }
 
-# ─── AI: перебор моделей ──────────────────────────────────────────────────────
-
 generate_ai_site() {
     local theme="$1"
     local output_file="$2"
 
-    # Единственная анонимная модель на text.pollinations.ai
-    local -a models=("openai-fast")
+    local -a models=("openai-fast" "openai")
 
     for model in "${models[@]}"; do
         echo -e "\r  ${BLUE}[AI]${NC} Пробую модель: ${CYAN}${model}${NC}...                    "
@@ -310,6 +313,7 @@ generate_ai_site() {
             return 0
         fi
         log "Модель $model не дала результат"
+        sleep 1
     done
 
     log "Все модели исчерпаны"
